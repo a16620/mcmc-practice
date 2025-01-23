@@ -183,7 +183,8 @@ bayes.glm.mh.sampler <- function(x, y, likelihood, link.fn, prior, proposal, ini
       
       next.beta <- mcmc.proposal$sampler(beta.chain[iter, i], sampler.C[i])
       if (is.na(next.beta)) {
-        print(sampler.C[i])
+        print(beta.chain[iter,i])
+        return()
       }
       prev.beta <- beta.chain[iter, i]
       
@@ -247,7 +248,7 @@ bayesGLM <- function(formula., data, family, prior, proposal=NULL, chain.cnt=4, 
   
   density.fn <- density_dict[[family$family]]
   
-  initial.beta <- NA
+  initial.beta <- NULL
   if (cheat.beta) {
     cheat.glm <- glm(formula., data=data, family = family)
     initial.beta <- cheat.glm$coefficient
@@ -403,7 +404,7 @@ bayes.block.mh.sampler <- function(blocks, likelihood, burn.in = 1000, iter.out 
   ))
 }
 
-bayesBlockedMH <- function(likelihood, blocks.info, iteration=10000, thin=1, chain.cnt=4) {
+bayesBlockedMH <- function(likelihood, blocks.info, iteration=10000, chain.cnt=4, ...) {
   chains <- data.frame()
   accept.rates <- data.frame()
   
@@ -412,7 +413,7 @@ bayesBlockedMH <- function(likelihood, blocks.info, iteration=10000, thin=1, cha
   pb$tick(len=0)
   
   for (i in 1:chain.cnt) {
-    chain.i <- suppressWarnings(bayes.block.mh.sampler(blocks.info, likelihood, iter.out=iteration))
+    chain.i <- suppressWarnings(bayes.block.mh.sampler(blocks.info, likelihood, iter.out=iteration, ...))
     chains <- rbind(chains, cbind(chain.i$params, data.frame(.iter=1:iteration, .chain=i)))
     accept.rates <- rbind(accept.rates, chain.i$accept.rate)
     pb$tick()
