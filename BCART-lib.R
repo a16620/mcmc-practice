@@ -6,21 +6,19 @@ library(ggpubr)
 
 ##################### Create #####################
 
-BCART <- function(formula., data, method, param.list=NULL) {
-  response <- data[, all.vars(formula.)[1]]
-  deps <- model.matrix(formula., data)
+BCART <- function(formula., data, param.list=NULL) {
+  combine.df <- model.frame(formula., data)
   print(paste0("Model: ", format(formula.)), quote=F)
   
-  
   tree <- list(params=append(list(), param.list))
-  tree$categorical <- is.factor(response)
+  tree$formula <- formula.
+  tree$categorical <- is.factor(combine.df[,1])
   
   if (is.null(tree$param$marginal))
-    tree$param$marginal <- CART.extract.marginal.params(formula., data, is.factor(response))
+    tree$param$marginal <- CART.extract.marginal.params(formula., data, tree$categorical)
   if (is.null(tree$param$split))
     tree$param$split <- c(0.95, 0.5)
   
-  combine.df <- cbind(response, deps)
   tree$tree <- CART.set.obs(Node$new("Root", param.split=tree$param$split, full.obs=combine.df), 1:nrow(combine.df))
   
   return(tree)
@@ -136,11 +134,12 @@ do.mcmc <- function(tree0, iteration=1000, moves=c("grow", "prune", "change", "s
             ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
             ncol = 1)
   
+  tree0$tree <- mtree 
   return(list(
     history=criteria.df,
     accept.rate=a.count/iteration,
     error.move=fail.count,
-    last=as.BCART(mtree, tree0$is.categorical, param)
+    last=tree0
   ))
 }
 
@@ -222,13 +221,34 @@ do.mcmc2 <- function(tree0, iteration=1000, moves=c("grow", "prune", "change", "
             ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
             ncol = 1)
   
+  tree0$tree <- selected.model
   return(list(
     history=criteria.df,
     accept.rate=a.count/iteration,
     error.move=fail.count,
-    model=as.BCART(selected.model, tree0$is.categorical, param),
+    model=tree0,
     score=selected.model.score
   ))
+}
+
+##################### Deploy #####################
+
+deploy <- function(tree) {
+  CART.set.predict(tree$tree)
+  CART.clean.obs(tree$tree)
+}
+
+Update.prediction <- function(tree, new.data) {
+  tree$tree$full.obs <- model.frame(tree$formula, new.data)
+  CART.set.obs(tree$tree, 1:nrow(new.data))
+  CART.update.obs(tree$tree)
+  if (!CART.check.tree.ok(tree$tree))
+    return(F)
+  
+  CART.set.predict(tree$tree)
+  CART.clean.obs(tree$tree) 
+  
+  return(T)
 }
 
 ##################### Probability #####################
@@ -526,8 +546,11 @@ CART.update.obs <- function(tree) {
   tree$Do(function(node) {
     obs.key <- node$split.rule$fun(CART.get.obs(node))
     
-    CART.set.obs(node$children[[1]], node$obs.idx[obs.key])
-    CART.set.obs(node$children[[2]], node$obs.idx[!obs.key])
+    left.obs.idx <- node$obs.idx[obs.key]
+    right.obs.idx <- node$obs.idx[!obs.key]
+    
+    CART.set.obs(node$children[[1]], left.obs.idx)
+    CART.set.obs(node$children[[2]], right.obs.idx)
   }, traversal="level", filterFun = isNotLeaf)
   return(CART.check.tree.ok(tree))
 }
