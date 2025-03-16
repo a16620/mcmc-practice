@@ -70,10 +70,14 @@ MCMC.param <- function(tree.st, marginal=T) {
   return(mcmc.param)
 }
 
-do.MCMC <- function(tree0, param, iteration=1000, moves=c("grow", "prune", "change", "swap"), prob.moves=NULL, verbose=F,
+do.MCMC <- function(tree0, param=NULL, iteration=1000, moves=c("grow", "prune", "change", "swap"), prob.moves=NULL, verbose=F,
                      additional.criteria=NULL, additional.criteria.fun=NULL, model.select.criteria=NULL) {
   stopifnot(length(moves) > 0)
   stopifnot(length(additional.criteria) == length(additional.criteria.fun))
+
+  if (is.null(param)) {
+    param <- MCMC.param(tree0)
+  }
   
   crit.loss <- ifelse(tree0$categorical, "miscl", "sse")
   if (is.null(model.select.criteria))
