@@ -64,7 +64,7 @@ MCMC.param <- function(tree.st, marginal=T) {
     else
       mcmc.param$tree.likelihood <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
   } else {
-    
+    print("You must implement marginal likelihood for tree.")
   }
   
   return(mcmc.param)
@@ -76,7 +76,7 @@ do.MCMC <- function(tree0, param=NULL, iteration=1000, moves=c("grow", "prune", 
   stopifnot(length(additional.criteria) == length(additional.criteria.fun))
 
   if (is.null(param)) {
-    param <- MCMC.param(tree0)
+    param <- MCMC.param(tree0, marginal=T)
   }
   
   crit.loss <- ifelse(tree0$categorical, "miscl", "sse")
