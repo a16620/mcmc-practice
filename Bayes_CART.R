@@ -6,21 +6,42 @@ library(ggpubr)
 
 ##################### Create #####################
 
-BCART <- function(formula., data) {
+BCART <- function(formula., data, method=NULL) {
   combine.df <- model.frame(formula., data)
-  print(paste0("Model: ", format(formula.)), quote=F)
+  y.is.factor <- is.factor(combine.df[,1])
   
-  tree.st <- list()
-  tree.st$formula <- formula.
-  tree.st$categorical <- is.factor(combine.df[,1])
-  tree.st$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df), 1:nrow(combine.df))
+  method.list <- c("category", "normal", "normal2", "poisson")
+  if (is.null(method)) {
+    if (y.is.factor)
+      method <- "category"
+    else
+      method <- "normal"
+  }
   
-  return(tree.st)
+  if (!(method %in% method.list)) {
+    cat("method must be (", paste(method.list, collapse = ', '), ")\n", sep='')
+    return(NULL)
+  }
+  
+  cat(paste0("Model: ", format(formula.)), " method=", method, sep='')
+  cat("\nPredictors: ", paste(colnames(combine.df)[-1], collapse=', '), '\n')
+  
+  model <- list()
+  model$formula <- formula.
+  model$method <- method
+  model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df), 1:nrow(combine.df))
+  
+  return(model)
 }
 
-CART.extract.marginal.params <- function(formula., data, is.categorical=F, uniform.dirichlet=0) {
-  if (is.categorical) {
-    Y <- data[, all.vars(formula.)[1]]
+##################### MCMC #####################
+
+extract.marginal.params <- function(model, uniform.dirichlet=0) {
+  method <- model$method
+  data <- model$tree$full.obs
+  
+  if (method == "category") {
+    Y <- data[, all.vars(model$formula)[1]]
     if (uniform.dirichlet != 0) {
       a <- rep(uniform.dirichlet, length(levels(Y)))
     } else {
@@ -33,8 +54,8 @@ CART.extract.marginal.params <- function(formula., data, is.categorical=F, unifo
       a.p=lgamma(sum(a))-sum(lgamma(a)),
       y.cont=F
     ))
-  } else {
-    fit.tree = rpart(formula., data=data, method="anova")
+  } else if (method == "normal") {
+    fit.tree <- rpart(model$formula, data=data, method="anova")
     var.est <- var(fit.tree$y)
     var.min <- data.frame(leaf=fit.tree$where, y=fit.tree$y) %>% group_by(leaf) %>% summarise(var=var(y)) %>% pull(var) %>% min()
     return(list(
@@ -47,61 +68,108 @@ CART.extract.marginal.params <- function(formula., data, is.categorical=F, unifo
   }
 }
 
-##################### MCMC #####################
-
-MCMC.param <- function(tree.st, marginal=T) {
+MCMC.param <- function(model, marginal.only=T) {
   mcmc.param <- list()
   
   mcmc.param$split.prob <- function(level) {
     0.95*level**(-0.5)
   }
   
-  mcmc.param$is.marginal <- marginal
-  if (marginal) {
-    marginal.param <- CART.extract.marginal.params(tree.st$formula, tree.st$tree$full.obs, tree.st$categorical)
-    if (tree.st$categorical)
-      mcmc.param$tree.likelihood <- function(tree) CART.prob.likelihood.marginal.category(tree, marginal.param)
-    else
-      mcmc.param$tree.likelihood <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
-  } else {
-    print("You must implement marginal likelihood for tree.")
-  }
+  marginal.param <- extract.marginal.params(model)
+  if (model$method == "category")
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.category(tree, marginal.param)
+  else if (model$method == "normal")
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
+  else if (model$method == "normal2")
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression2(tree, marginal.param)
+  else if (model$method == "poisson")
+    mcmc.param$tree.marginal <- NULL
   
+  mcmc.param$use.latent <- !(marginal.only || model$method %in% c("category", "normal", "normal2"))
+
   return(mcmc.param)
 }
 
-do.MCMC <- function(tree0, param=NULL, iteration=1000, moves=c("grow", "prune", "change", "swap"), prob.moves=NULL, verbose=F,
-                     additional.criteria=NULL, additional.criteria.fun=NULL, model.select.criteria=NULL) {
+do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
+                    moves=c("grow", "prune", "change", "swap"), prob.moves=NULL,
+                    verbose=F, plot.trace=T, additional.criteria=NULL, additional.criteria.fun=NULL, model.select.criteria=NULL) {
   stopifnot(length(moves) > 0)
   stopifnot(length(additional.criteria) == length(additional.criteria.fun))
 
   if (is.null(param)) {
-    param <- MCMC.param(tree0, marginal=T)
+    param <- MCMC.param(model0)
   }
   
-  crit.loss <- ifelse(tree0$categorical, "miscl", "sse")
+  if (model0$method == "category") {
+    crit.loss <- "miscl"
+    crit.loss.fn <- CART.get.tree.train.miscl
+  } else if (model0$method %in% c("normal", "normal2")) {
+    crit.loss <- "sse"
+    crit.loss.fn <- CART.get.tree.train.SSE
+  } else {
+    crit.loss <- 'DIC'
+    crit.loss.fn <- NULL
+  }
+  
+  tree.marginal.lik <- param$tree.marginal
+  
+  criteria.name <- append(c("log.post", "n.leaf", crit.loss), additional.criteria)
+  criteria.funs <- setNames(append(list(
+    function(tree) {tree.marginal.lik(tree)+CART.prob.prior(tree, param$split.prob)},
+    function(tree) {tree$leafCount},
+    crit.loss.fn
+  ), additional.criteria.fun), criteria.name)
+  
   if (is.null(model.select.criteria))
     model.select.criteria <- crit.loss
   
-  tree.lik.fn <- param$tree.likelihood
+  mtree <- Clone(model0$tree)
+  #burn in
+  if (burn.in > 0) {
+    if (verbose) {
+      cat("burn-in...")
+    }
+    burn.in.l.post <- tree.marginal.lik(mtree)
+    for (iter in 1:burn.in) {
+      mc.move <- sample(moves, 1, prob = prob.moves)
+      if (mc.move == "grow") {
+        mc.new <- CART.move.grow(mtree, param$split.prob)
+      } else if (mc.move == "prune") {
+        mc.new <- CART.move.prune(mtree, param$split.prob)
+      } else if (mc.move == "change") {
+        mc.new <- CART.move.change(mtree, param$split.prob, only.value = (runif(1) < 0.5))
+      } else if (mc.move == "swap") {
+        mc.new <- CART.move.swap(mtree, param$split.prob)
+      }
+      
+      if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
+        next
+      }
+      
+      burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)
+      l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
+      l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
+      
+      if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
+        mtree <- mc.new$tree.new
+        burn.in.l.post <- burn.in.l.post.new
+      }
+    }
+    if (verbose) {
+      cat("end!\n")
+    }
+  }
   
-  criteria.name <- append(c("log.post", "n.leaf", crit.loss), additional.criteria)
-  criteria.funs <- append(list(
-    function(tree) {tree.lik.fn(tree)+CART.prob.prior(tree, param$split.prob)},
-    function(tree) {tree$leafCount},
-    if (tree0$categorical) CART.get.tree.train.miscl else CART.get.tree.train.SSE
-  ), additional.criteria.fun)
-  
-  print.intval <- as.integer(iteration*0.1)
-  
-  mtree <- Clone(tree0$tree)
+  #with record
   criteria.matrix <- `colnames<-`(matrix(0, ncol=length(criteria.name), nrow=iteration), criteria.name)
   criteria.matrix[1,] <- sapply(criteria.funs, function(cfn) {cfn(mtree)})
   
   selected.model <- mtree
   selected.model.score <- criteria.matrix[1, model.select.criteria]
   
-  a.count <- 0
+  print.intval <- as.integer(iteration*0.1)
+  
+  accept.count <- setNames(rep(0, length(moves)), moves)
   fail.count <- setNames(rep(0, length(moves)), moves)
   for (iter in 2:iteration) {
     mc.move <- sample(moves, 1, prob = prob.moves)
@@ -117,63 +185,64 @@ do.MCMC <- function(tree0, param=NULL, iteration=1000, moves=c("grow", "prune", 
     
     if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
       fail.count[mc.move] <- fail.count[mc.move]+1
-      criteria.matrix[iter,] <- criteria.matrix[iter-1,]
-      next
-    }
-    
-    criteria.new.tree <- sapply(criteria.funs, function(cfn) {cfn(mtree)})
-    
-    l.a.ratio.u <- (mc.new$l.prob.rev+criteria.new.tree[1])
-    l.a.ratio.l <- mc.new$l.prob+criteria.matrix[iter-1,1]
-    
-    if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
-      mtree <- mc.new$tree.new
-      criteria.matrix[iter,] <- criteria.new.tree
-      a.count <- a.count + 1
+      criteria.new.tree <- criteria.matrix[iter-1,]
     } else {
-      criteria.matrix[iter,] <- criteria.matrix[iter-1,]
+      criteria.new.tree <- sapply(criteria.funs, function(cfn) {cfn(mtree)})
+      
+      l.a.ratio.u <- mc.new$l.prob.rev+criteria.new.tree[1]
+      l.a.ratio.l <- mc.new$l.prob+criteria.matrix[iter-1,1]
+      
+      if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
+        mtree <- mc.new$tree.new
+        accept.count[mc.move] <- accept.count[mc.move] + 1
+      } else {
+        criteria.new.tree <- criteria.matrix[iter-1,]
+      }
     }
+    criteria.matrix[iter,] <- criteria.new.tree
     
-    if (selected.model.score >= criteria.matrix[iter, model.select.criteria]) {
+    if (selected.model.score >= criteria.new.tree[model.select.criteria]) {
       selected.model <- mtree
-      selected.model.score <- criteria.matrix[iter, model.select.criteria]
+      selected.model.score <- criteria.new.tree[model.select.criteria]
     }
     
     if (verbose && iter %% print.intval == 0) {
-      print(paste0('============= #', as.character(iter), '(', format(a.count/iter, digits = 3),')'), quot=F)
+      cat('============= #', as.character(iter), '(', format(sum(accept.count)/iter, digits = 3),')\n', sep='')
       print(colMeans(criteria.matrix[(iter-print.intval+1):(iter),]), quot=F)
     }
   }
   
   criteria.df <- as.data.frame(criteria.matrix)
-  ggarrange(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
-            ggplot() + geom_line(aes(x=1:iteration, y=criteria.df[,crit.loss]))+xlab('iter')+ylab(crit.loss)+theme_classic(),
-            ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
-            ncol = 1)
-  
-  tree0$tree <- selected.model
+  if (plot.trace) {
+    ggarrange(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
+              ggplot() + geom_line(aes(x=1:iteration, y=criteria.df[,crit.loss]))+xlab('iter')+ylab(crit.loss)+theme_classic(),
+              ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
+              ncol = 1)
+  }
+  model0$tree <- selected.model
   return(list(
     history=criteria.df,
-    accept.rate=a.count/iteration,
     error.move=fail.count,
-    model=tree0,
+    accept.move=accept.count,
+    accept.rate=sum(accept.count)/iteration,
+    model=model0,
     score=selected.model.score
   ))
 }
 
 ##################### Deploy #####################
 
-deploy <- function(tree.st) {
-  tree <- tree.st$tree
+deploy <- function(model) {
+  tree <- model$tree
   if (is.null(tree$full.obs))
     return()
   CART.set.predict(tree)
   CART.clean.obs(tree)
 }
 
-Update.prediction <- function(tree.st, new.data) {
-  tree <- tree.st$tree
-  tree$full.obs <- model.frame(tree.st$formula, new.data)
+Update.prediction <- function(model, new.data) {
+  tree <- model$tree
+  tree$full.obs <- model.frame(model$formula, new.data)
   CART.set.obs(tree, 1:nrow(new.data))
   CART.update.obs(tree)
   if (!CART.check.tree.ok(tree))
