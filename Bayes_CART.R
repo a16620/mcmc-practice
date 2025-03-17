@@ -129,7 +129,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
     if (verbose) {
       cat("burn-in...")
     }
-    burn.in.l.post <- tree.marginal.lik(mtree)
+    burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, param$split.prob)
     for (iter in 1:burn.in) {
       mc.move <- sample(moves, 1, prob = prob.moves)
       if (mc.move == "grow") {
@@ -146,7 +146,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         next
       }
       
-      burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)
+      burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, param$split.prob)
       l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
       l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
       
@@ -167,7 +167,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   selected.model <- mtree
   selected.model.score <- criteria.matrix[1, model.select.criteria]
   
-  print.intval <- as.integer(iteration*0.1)
+  print.intval <- if (iteration < 20) iteration else as.integer(iteration*0.1)
   
   accept.count <- setNames(rep(0, length(moves)), moves)
   fail.count <- setNames(rep(0, length(moves)), moves)
@@ -517,21 +517,14 @@ CART.set.rule <- function(node, rule.info) {
     return(obs.filt.col <= rule.info$split.value)
   }
   
-  obs <- CART.get.obs(node)
-  obs.key <- rule(obs)
-  if (all(obs.key) || !any(obs.key))
-    return(F)
-  
   rule.info$fun <- rule
   node$split.rule <- rule.info
-  left.obs.idx <- node$obs.idx[obs.key]
-  right.obs.idx <- node$obs.idx[!obs.key]
   
-  child.names <- CART.rule2name(obs, rule.info$split.col, rule.info$split.value)
-  CART.set.obs(node$AddChild(child.names[1]), left.obs.idx)
-  CART.set.obs(node$AddChild(child.names[2]), right.obs.idx)
+  child.names <- CART.rule2name(CART.get.obs(node), rule.info$split.col, rule.info$split.value)
+  node$AddChild(child.names[1])
+  node$AddChild(child.names[2])
   
-  return(T)
+  return(CART.update.obs(node))
 }
 
 ##################### Change, Swap #####################
@@ -567,19 +560,15 @@ CART.update.rule <- function(node, rule.info) {
     return(obs.filt.col <= rule.info$split.value)
   }
   
-  obs <- CART.get.obs(node)
-  obs.key <- rule(obs)
-  if (all(obs.key) || !any(obs.key))
-    return(F)
-  
   rule.info$fun <- rule
   node$split.rule <- rule.info
   
-  child.names <- CART.rule2name(obs, rule.info$split.col, rule.info$split.value)
+  child.names <- CART.rule2name(CART.get.obs(node), rule.info$split.col, rule.info$split.value)
   names(node$children) <- child.names
   node$children[[1]]$name <- child.names[1]
   node$children[[2]]$name <- child.names[2]
-  return(T)
+  
+  return(CART.update.obs(node))
 }
 
 CART.compare.rule <- function(rule1, rule2) {
@@ -681,7 +670,7 @@ CART.move.change <- function(tree, split.prob, only.value=F) {
     subtree <- Clone(selected.node)
     subtree$full.obs <- tree.new$full.obs
     
-    if (!CART.update.rule(subtree, rule) || !CART.update.obs(subtree)) {
+    if (!CART.update.rule(subtree, rule)) {
       next
     }
     ok <- T
@@ -743,7 +732,7 @@ CART.move.swap <- function(tree, split.prob) {
       CART.update.rule.swap(child.node, rule.parent)
     }
     
-    if (!CART.update.rule(subtree, rule.child) || !CART.update.obs(subtree)) {
+    if (!CART.update.rule(subtree, rule.child)) {
       if (sel.is.root)
         tree.new <- Clone(tree)
       next
