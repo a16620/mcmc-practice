@@ -214,10 +214,10 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   
   criteria.df <- as.data.frame(criteria.matrix)
   if (plot.trace) {
-    ggarrange(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
+    print(ggarrange(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
               ggplot() + geom_line(aes(x=1:iteration, y=criteria.df[,crit.loss]))+xlab('iter')+ylab(crit.loss)+theme_classic(),
               ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
-              ncol = 1)
+              ncol = 1))
   }
   model0$tree <- selected.model
   return(list(
@@ -732,13 +732,13 @@ CART.move.swap <- function(tree, split.prob) {
       subtree$full.obs <- tree.new$full.obs
     }
     
-    child.isLeaf <- sapply(subtree$children, isNotLeaf)
-    if (all(child.isLeaf) && CART.compare.rule(subtree$children[[1]]$split.rule, subtree$children[[2]]$split.rule)) {
+    child.isNotLeaf <- sapply(subtree$children, isNotLeaf)
+    if (all(child.isNotLeaf) && CART.compare.rule(subtree$children[[1]]$split.rule, subtree$children[[2]]$split.rule)) {
       rule.child <- subtree$children[[1]]$split.rule
       CART.update.rule.swap(subtree$children[[1]], rule.parent)
       CART.update.rule.swap(subtree$children[[2]], rule.parent)
     } else {
-      child.node <- subtree$children[[sample(1:2, 1, prob = as.probability(child.isLeaf))]]
+      child.node <- subtree$children[[sample(1:2, 1, prob = as.probability(child.isNotLeaf))]]
       rule.child <- child.node$split.rule
       CART.update.rule.swap(child.node, rule.parent)
     }
