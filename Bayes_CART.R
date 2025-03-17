@@ -6,7 +6,7 @@ library(ggpubr)
 
 ##################### Create #####################
 
-BCART <- function(formula., data, method=NULL) {
+BCART <- function(formula., data, method=NULL, print.model=F) {
   combine.df <- model.frame(formula., data)
   y.is.factor <- is.factor(combine.df[,1])
   
@@ -23,13 +23,16 @@ BCART <- function(formula., data, method=NULL) {
     return(NULL)
   }
   
-  cat(paste0("Model: ", format(formula.)), " method=", method, sep='')
-  cat("\nPredictors: ", paste(colnames(combine.df)[-1], collapse=', '), '\n')
+  if (print.model) {
+    cat(paste0("Model: ", format(formula.)), " method=", method, sep='')
+    cat("\nPredictors: ", paste(colnames(combine.df)[-1], collapse=', '), '\n')
+  }
   
   model <- list()
   model$formula <- formula.
   model$method <- method
-  model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df), 1:nrow(combine.df))
+  model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df, memo.writer=CART.get.memo.writer(method)), 1:nrow(combine.df))
+  model$tree$Do(model$tree$memo.writer)
   
   return(model)
 }
@@ -254,39 +257,55 @@ Update.prediction <- function(model, new.data) {
   return(T)
 }
 
+##################### Sample latent #####################
+
+##################### Memo #####################
+
+CART.get.memo.writer <- function(method) {
+  if (method %in% c("normal", "normal2"))
+    CART.memo.regression
+  else if (method == "category")
+    CART.memo.category
+}
+
+CART.memo.regression <- function(node) {
+  node.obs <- CART.get.obs(node)
+  #n.i, mean(y.i), s.i
+  node$memo <- c(length(node$obs.idx), log(length(node$obs.idx)), mean(node.obs[,1]), CART.get.node.train.SSE(node))
+}
+
+CART.memo.category <- function(node) {
+  node.obs <- CART.get.obs(node)
+  #n.i, mean(y.i), s.i
+  node$memo <- as.numeric(table(node.obs[,1]))
+}
+
 ##################### Probability #####################
 
-CART.prob.likelihood.marginal.regression <- function(tree, params, verb=F) {
+CART.prob.likelihood.marginal.regression <- function(tree, params) {
   c.a <- params$a
-  c.b <- tree$leafCount
-  c.c <- ifelse(is.null(params$c), 0, params$c)
   c.mu <- params$mu
-  c.nu <- params$nu
-  c.lambda <- params$lambda
   
-  l.prob <- c.c+0.5*c.b*log(c.a)-0.5*sum(sapply(tree$leaves, function(node) log(length(node$obs.idx))))-
-    0.5*(nrow(tree$full.obs)+c.nu)*log(sum(sapply(tree$leaves, function(node) {
-      node.obs <- CART.get.obs(node)
-      
-      n.i <- nrow(node.obs)
-      y.i <- node.obs[,1]
-      s.i <- CART.get.node.train.SSE(node)
-      t.i <- (mean(y.i)-c.mu)**2*c.a*n.i/(c.a+n.i)
-      return(t.i+s.i)
-    }))+c.nu*c.lambda)
+  l.prob <- ifelse(is.null(params$c), 0, params$c)+
+    0.5*tree$leafCount*log(c.a)-0.5*sum(sapply(tree$leaves, function(node) {node$memo[2]}))-
+    0.5*(nrow(tree$full.obs)+params$nu)*log(sum(sapply(tree$leaves, function(node) {
+      memo <- node$memo
+      t.i <- (memo[3]-c.mu)**2*c.a*memo[1]/(c.a+memo[1])
+      return(t.i+memo[4])
+    }))+params$nu*params$lambda)
   return(l.prob)
 }
 
 #V2
 CART.prob.likelihood.marginal.regression2 <- function(tree, params) {
   c.a <- params$a
-  c.c <- ifelse(is.null(params$c), 0, params$c)
   c.mu <- params$mu
   c.nu <- params$nu
   c.nuMlamb <- params$lambda*c.nu
   c.aMnu <- 0.5*log(c.a)-lgamma(c.nu/2)
   
-  l.prob <- c.c+0.5*c.nu*log(c.nuMlamb)+
+  l.prob <- ifelse(is.null(params$c), 0, params$c)+
+    0.5*c.nu*log(c.nuMlamb)+
     sum(sapply(tree$leaves, function(node) {
       n.i <- length(node$obs.idx)
       c.aMnu-0.5*log(n.i+c.a)+lgamma((n.i+c.nu)/2)
@@ -302,16 +321,13 @@ CART.prob.likelihood.marginal.regression2 <- function(tree, params) {
   return(l.prob)
 }
 
-CART.prob.likelihood.marginal.category <- function(tree, params, verb=F) {
+CART.prob.likelihood.marginal.category <- function(tree, params) {
   c.a <- params$a
   c.as <- params$a.s
   c.ap <- params$a.p
   l.prob <- sum(sapply(tree$leaves, function(node) {
     node.obs <- CART.get.obs(node)
-    n.i <- as.numeric(table(node.obs[,1]))
-    if (verb) {
-      print(n.i)
-    }
+    n.i <- node$memo
     return(c.ap+sum(lgamma(n.i+c.a))-lgamma(sum(n.i)+c.as))
   }))
   return(l.prob)
@@ -601,6 +617,7 @@ CART.move.grow <- function(tree, split.prob) {
       next
     }
     if (CART.set.rule(selected.node, rule)) {
+      Do(selected.node$children, tree$memo.writer)
       break
     }
   }
@@ -667,10 +684,17 @@ CART.move.change <- function(tree, split.prob, only.value=F) {
     if (is.null(rule))
       next
     
-    subtree <- Clone(selected.node)
-    subtree$full.obs <- tree.new$full.obs
+    sel.is.root <- isRoot(selected.node)
+    if (sel.is.root) {
+      subtree <- tree.new
+    } else {
+      subtree <- Clone(selected.node)
+      subtree$full.obs <- tree.new$full.obs
+    }
     
     if (!CART.update.rule(subtree, rule)) {
+      if (sel.is.root)
+        tree.new <- Clone(tree)
       next
     }
     ok <- T
@@ -682,7 +706,7 @@ CART.move.change <- function(tree, split.prob, only.value=F) {
     } else {
       tree.new <- subtree
     }
-    
+    subtree$Do(tree$memo.writer)
     break
   }
   if (!ok)
@@ -744,7 +768,7 @@ CART.move.swap <- function(tree, split.prob) {
       parent.of.no$RemoveChild(selected.node$name)
       parent.of.no$AddChildNode(subtree)
     }
-    
+    subtree$Do(tree$memo.writer)
     break
   }
   if (!ok)
