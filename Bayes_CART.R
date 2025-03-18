@@ -31,8 +31,7 @@ BCART <- function(formula., data, method=NULL, print.model=F) {
   model <- list()
   model$formula <- formula.
   model$method <- method
-  model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df, memo.writer=CART.get.memo.writer(method)), 1:nrow(combine.df))
-  model$tree$Do(model$tree$memo.writer)
+  model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df), 1:nrow(combine.df))
   
   return(model)
 }
@@ -79,14 +78,19 @@ MCMC.param <- function(model, marginal.only=T) {
   }
   
   marginal.param <- extract.marginal.params(model)
-  if (model$method == "category")
+  if (model$method == "category") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.category(tree, marginal.param)
-  else if (model$method == "normal")
+    mcmc.param$memo.writer <- CART.memo.category
+  } else if (model$method == "normal") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
-  else if (model$method == "normal2")
+    mcmc.param$memo.writer <- CART.memo.regression
+  } else if (model$method == "normal2") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression2(tree, marginal.param)
-  else if (model$method == "poisson")
+    mcmc.param$memo.writer <- CART.memo.regression
+  } else if (model$method == "poisson") {
     mcmc.param$tree.marginal <- NULL
+    mcmc.param$memo.writer <- NULL
+  }
   
   mcmc.param$use.latent <- !(marginal.only || model$method %in% c("category", "normal", "normal2"))
 
@@ -126,7 +130,11 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   if (is.null(model.select.criteria))
     model.select.criteria <- crit.loss
   
+  split.prob <- param$split.prob
+  memo.writer <- param$memo.writer
+  
   mtree <- Clone(model0$tree)
+  mtree$Do(memo.writer)
   #burn in
   if (burn.in > 0) {
     if (verbose) {
@@ -136,13 +144,13 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
     for (iter in 1:burn.in) {
       mc.move <- sample(moves, 1, prob = prob.moves)
       if (mc.move == "grow") {
-        mc.new <- CART.move.grow(mtree, param$split.prob)
+        mc.new <- CART.move.grow(mtree, split.prob, memo.writer)
       } else if (mc.move == "prune") {
-        mc.new <- CART.move.prune(mtree, param$split.prob)
+        mc.new <- CART.move.prune(mtree, split.prob, memo.writer)
       } else if (mc.move == "change") {
-        mc.new <- CART.move.change(mtree, param$split.prob, only.value = (runif(1) < 0.5))
+        mc.new <- CART.move.change(mtree, split.prob, memo.writer, only.value = (runif(1) < 0.5))
       } else if (mc.move == "swap") {
-        mc.new <- CART.move.swap(mtree, param$split.prob)
+        mc.new <- CART.move.swap(mtree, split.prob, memo.writer)
       }
       
       if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
@@ -177,13 +185,13 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   for (iter in 2:iteration) {
     mc.move <- sample(moves, 1, prob = prob.moves)
     if (mc.move == "grow") {
-      mc.new <- CART.move.grow(mtree, param$split.prob)
+      mc.new <- CART.move.grow(mtree, split.prob, memo.writer)
     } else if (mc.move == "prune") {
-      mc.new <- CART.move.prune(mtree, param$split.prob)
+      mc.new <- CART.move.prune(mtree, split.prob, memo.writer)
     } else if (mc.move == "change") {
-      mc.new <- CART.move.change(mtree, param$split.prob, only.value = (runif(1) < 0.5))
+      mc.new <- CART.move.change(mtree, split.prob, memo.writer, only.value = (runif(1) < 0.5))
     } else if (mc.move == "swap") {
-      mc.new <- CART.move.swap(mtree, param$split.prob)
+      mc.new <- CART.move.swap(mtree, split.prob, memo.writer)
     }
     
     if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
@@ -260,13 +268,6 @@ Update.prediction <- function(model, new.data) {
 ##################### Sample latent #####################
 
 ##################### Memo #####################
-
-CART.get.memo.writer <- function(method) {
-  if (method %in% c("normal", "normal2"))
-    CART.memo.regression
-  else if (method == "category")
-    CART.memo.category
-}
 
 CART.memo.regression <- function(node) {
   node.obs <- CART.get.obs(node)
@@ -600,7 +601,7 @@ CART.compare.rule <- function(rule1, rule2) {
 
 ##################### MCMC moves #####################
 
-CART.move.grow <- function(tree, split.prob) {
+CART.move.grow <- function(tree, split.prob, memo.writer) {
   tree.new <- Clone(tree)
   
   terminal.nodes <- tree.new$leaves
@@ -617,7 +618,8 @@ CART.move.grow <- function(tree, split.prob) {
       next
     }
     if (CART.set.rule(selected.node, rule)) {
-      Do(selected.node$children, tree$memo.writer)
+      selected.node$RemoveAttribute('memo')
+      Do(selected.node$children, memo.writer)
       break
     }
   }
@@ -634,7 +636,7 @@ CART.move.grow <- function(tree, split.prob) {
   ))
 }
 
-CART.move.prune <- function(tree, split.prob) {
+CART.move.prune <- function(tree, split.prob, memo.writer) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
@@ -654,6 +656,7 @@ CART.move.prune <- function(tree, split.prob) {
     print("Warning: Pruned not 2")
   l.prob.sel.split <- CART.prob.rule(selected.node)
   selected.node$RemoveAttribute('split.rule')
+  memo.writer(selected.node)
   
   return(list(
     tree.new=tree.new,
@@ -662,7 +665,7 @@ CART.move.prune <- function(tree, split.prob) {
   ))
 }
 
-CART.move.change <- function(tree, split.prob, only.value=F) {
+CART.move.change <- function(tree, split.prob, memo.writer, only.value=F) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
@@ -706,7 +709,7 @@ CART.move.change <- function(tree, split.prob, only.value=F) {
     } else {
       tree.new <- subtree
     }
-    subtree$Do(tree$memo.writer)
+    subtree$Do(memo.writer, filterFun = isLeaf)
     break
   }
   if (!ok)
@@ -718,7 +721,7 @@ CART.move.change <- function(tree, split.prob, only.value=F) {
   ))
 }
 
-CART.move.swap <- function(tree, split.prob) {
+CART.move.swap <- function(tree, split.prob, memo.writer) {
   if (tree$leafCount < 3) {
     return(NULL)
   }
@@ -768,7 +771,7 @@ CART.move.swap <- function(tree, split.prob) {
       parent.of.no$RemoveChild(selected.node$name)
       parent.of.no$AddChildNode(subtree)
     }
-    subtree$Do(tree$memo.writer)
+    subtree$Do(memo.writer, filterFun = isLeaf)
     break
   }
   if (!ok)
