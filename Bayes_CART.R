@@ -139,32 +139,47 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
     marginal.param <- extract.marginal.params(model)
   if (model$method == "category") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.category(tree, marginal.param)
-    mcmc.param$memo.writer <- CART.memo.category(marginal.param)
+    mcmc.param$after.move <- CART.memo.category(marginal.param)
     
     mcmc.param$crit.loss <- "miscl"
-    mcmc.param$crit.fn <- CART.get.tree.train.miscl
+    mcmc.param$crit.fn <- CART.criteria.train.miscl
   } else if (model$method == "normal") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
-    mcmc.param$memo.writer <- CART.memo.regression(marginal.param)
+    mcmc.param$after.move <- CART.memo.regression(marginal.param)
     
     mcmc.param$crit.loss <- "SSE"
-    mcmc.param$crit.fn <- CART.get.tree.train.SSE
+    mcmc.param$crit.fn <- CART.criteria.train.SSE
   } else if (model$method == "poisson") {
-    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.poisson(tree, marginal.param)
-    mcmc.param$memo.writer <- CART.memo.poisson(marginal.param)
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
+    mcmc.param$after.move <- CART.memo.poisson(marginal.param)
     
     mcmc.param$crit.loss <- "DIC"
-    mcmc.param$crit.fn <- CART.get.tree.DIC.poisson
+    mcmc.param$crit.fn <- CART.criteria.DIC
   } else if (model$method == "nb") {
-    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
-    mcmc.param$memo.writer <- CART.memo.regression(marginal.param)
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
+    mcmc.param$after.move <- CART.memo.NB(marginal.param)
+    
+    mcmc.param$crit.loss <- "DIC"
+    mcmc.param$crit.fn <- CART.criteria.DIC
   } else if (model$method == "zip") {
-    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
-    mcmc.param$memo.writer <- CART.memo.regression(marginal.param)
+    mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
+    mcmc.param$after.move <- CART.memo.poisson(marginal.param)
+    
+    mcmc.param$crit.loss <- "DIC"
+    mcmc.param$crit.fn <- CART.criteria.DIC
   }
   
   mcmc.param$use.latent <- !(marginal.only || model$method %in% c("category", "normal", "poisson"))
 
+  if (mcmc.param$use.latent) {
+    if (model$method == "nb") {
+      mcmc.param$latent.sampler <- CART.latent.param.sampler.NB
+      mcmc.param$latent.init <- CART.latent.param.initializer.NB(marginal.param)
+    } else if (model$method == "zip") {
+      
+    }
+  }
+  
   return(mcmc.param)
 }
 
@@ -194,11 +209,17 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
     model.select.criteria <- crit.loss
   
   split.prob <- param$split.prob
-  memo.writer <- param$memo.writer
+  after.move <- param$after.move
   
   mtree <- Clone(model0$tree)
   stopifnot(CART.check.tree.ok(mtree))
-  mtree$Do(memo.writer)
+  
+  use.latent <- param$use.latent
+  if (use.latent) {
+    latent.sampler <- param$latent.sampler
+    Do(mtree$leaves, param$latent.init)
+  }
+  Do(mtree$leaves, after.move)
   
   #burn in
   if (burn.in > 0) {
@@ -209,31 +230,27 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
     for (iter in 1:burn.in) {
       mc.move <- sample(moves, 1, prob = prob.moves)
       if (mc.move == "grow") {
-        mc.new <- CART.move.grow(mtree, split.prob, memo.writer)
+        mc.new <- CART.move.grow(mtree, split.prob, after.move)
       } else if (mc.move == "prune") {
-        mc.new <- CART.move.prune(mtree, split.prob, memo.writer)
+        mc.new <- CART.move.prune(mtree, split.prob, after.move)
       } else if (mc.move == "change") {
-        mc.new <- CART.move.change(mtree, split.prob, memo.writer, only.value = (runif(1) < 0.5))
+        mc.new <- CART.move.change(mtree, split.prob, after.move, only.value = (runif(1) < 0.5))
       } else if (mc.move == "swap") {
-        mc.new <- CART.move.swap(mtree, split.prob, memo.writer)
+        mc.new <- CART.move.swap(mtree, split.prob, after.move)
       }
       
       if (!is.null(mc.new) && CART.check.tree.ok(mc.new$tree.new)) {
         burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, param$split.prob)
         l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
         l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
-        if(length(l.a.ratio.u-l.a.ratio.l) == 0) {
-          print(mc.new$l.prob.rev)
-          print(mc.new$l.prob)
-          print(burn.in.l.post.new)
-          print(burn.in.l.post)
-          print(mc.move)
-        }
         
         if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
           mtree <- mc.new$tree.new
           burn.in.l.post <- burn.in.l.post.new
         }
+        
+        if (use.latent)
+          CART.latent.param.sampling(mtree, latent.sampler)
       }
     }
     if (verbose) {
@@ -259,13 +276,13 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   for (iter in 2:iteration) {
     mc.move <- sample(moves, 1, prob = prob.moves)
     if (mc.move == "grow") {
-      mc.new <- CART.move.grow(mtree, split.prob, memo.writer)
+      mc.new <- CART.move.grow(mtree, split.prob, after.move)
     } else if (mc.move == "prune") {
-      mc.new <- CART.move.prune(mtree, split.prob, memo.writer)
+      mc.new <- CART.move.prune(mtree, split.prob, after.move)
     } else if (mc.move == "change") {
-      mc.new <- CART.move.change(mtree, split.prob, memo.writer, only.value = (runif(1) < 0.5))
+      mc.new <- CART.move.change(mtree, split.prob, after.move, only.value = (runif(1) < 0.5))
     } else if (mc.move == "swap") {
-      mc.new <- CART.move.swap(mtree, split.prob, memo.writer)
+      mc.new <- CART.move.swap(mtree, split.prob, after.move)
     }
     
     if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
@@ -288,6 +305,9 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         criteria.new.tree <- criteria.matrix[iter-1,]
       }
     }
+    if (use.latent)
+      CART.latent.param.sampling(mtree, latent.sampler)
+    
     criteria.matrix[iter,] <- criteria.new.tree
     
     if (verbose && iter %% print.intval == 0) {
@@ -379,14 +399,14 @@ CART.prob.likelihood.marginal.category <- function(tree, params) {
   return(l.prob)
 }
 
-CART.prob.likelihood.marginal.poisson <- function(tree, params) {
+CART.prob.likelihood.marginal.memo <- function(tree, params) {
   l.prob <- sum(vapply(tree$leaves, function(node) {node$memo[1]}, numeric(1)))
   return(l.prob)
 }
 
 ##################### Criteria #####################
 
-CART.get.tree.train.SSE <- function(tree) {
+CART.criteria.train.SSE <- function(tree) {
   sum(vapply(tree$leaves, CART.get.node.train.SSE, numeric(1)))
 }
 
@@ -403,7 +423,7 @@ CART.get.node.train.SSE <- function(node) {
   }
 }
 
-CART.get.tree.train.miscl <- function(tree) {
+CART.criteria.train.miscl <- function(tree) {
   n.total <- nrow(tree$full.obs)
   sum(vapply(tree$leaves, function(node) {
     CART.get.node.train.miscl(node)*length(node$obs.idx)/n.total
@@ -422,8 +442,24 @@ CART.get.node.train.miscl <- function(node) {
   }
 }
 
-CART.get.tree.DIC.poisson <- function(tree) {
+CART.criteria.DIC <- function(tree) {
   sum(vapply(tree$leaves, function(node) node$memo[2], numeric(1)))
+}
+
+##################### Latent #####################
+
+CART.latent.param.sampling <- function(tree, sampler) {
+  Do(tree$leaves, sampler)
+}
+
+CART.latent.param.sampler.NB <- function(node) {
+  node$latent.param <- rgamma(1, node$memo[3], node$memo[4])
+}
+
+CART.latent.param.initializer.NB <- function(params) {
+  function(node) {
+    node$latent.param <- rgamma(1, params$a, params$b)
+  }
 }
 
 ##################### Memo #####################
@@ -472,6 +508,44 @@ CART.memo.poisson <- function(params) {
   }
 }
 
+CART.memo.NB <- function(params) {
+  c.a <- params$a
+  c.b <- params$b
+  c.C <- params$C #a*log(b)-lgamma(a)
+  
+  function(node) {
+    node.obs <- CART.get.obs.pred(node)
+    N.t <- node.obs[,1]
+    v.t <- node.obs[,2]
+    N.sum <- sum(N.t)
+    v.sum <- sum(v.t)
+    n.t <- nrow(node.obs)
+
+    lambda.est.t <- N.sum/v.sum
+    V.est.t2 <- 1/(n.t-1)*sum(v.t*(N.t/v.t-lambda.est.t)**2)
+    K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
+
+    #latent
+    lambda.t <- node$latent.param
+    xi.t <- rgamma(n.t, K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
+    CART.set.latent.obs(node, xi.t)
+
+    #memo
+    log.v <- log(v.t)
+    v.log.v <- sum(v.t*log.v)
+    M.1 <- K.t*(log(K.t)*sum(v.t)+K.t*v.log.v)
+    M.2 <- sum(lg(K.t*v.t)+lg(N.t+1))
+    M.3 <- sum((K.t*v.t+N.t-1)*log(xi.t))
+    sum.n.a <- sum(N.t)+c.a
+    sum.xv.b <- sum(xi.t*v.t)+c.b
+    l.post <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lg(sum.n.a)-sum.n.a*log(sum.xv.b)
+    nxv.ratio <- sum.n.a/sum.xv.b
+    dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+M.2-M.1-M.3+1+
+                 2*(log(sum.n.a)-digamma(sum.n.a))*(sum.n.a-c.a) )
+    node$memo <- c(l.post, dic, sum.n.a, sum.xv.b)
+  }
+}
+
 ##################### Utility #####################
 
 CART.check.tree.ok <- function(tree) {
@@ -497,6 +571,16 @@ CART.rule2name <- function(obs, split.col, split.value) {
       paste0(split.col, ">", num.to.str)
     ))
   }
+}
+
+CART.get.latent.obs <- function(node) {
+  root <- node$root
+  return(root$latents[node$obs.idx, , drop=F])
+}
+
+CART.set.latent.obs <- function(node, values) {
+  root <- node$root
+  root$full.obs[node$obs.idx, ] <- values
 }
 
 CART.get.obs <- function(node) {
@@ -661,7 +745,7 @@ CART.compare.rule <- function(rule1, rule2) {
 
 ##################### MCMC moves #####################
 
-CART.move.grow <- function(tree, split.prob, memo.writer) {
+CART.move.grow <- function(tree, split.prob, after.move) {
   tree.new <- Clone(tree)
   
   terminal.nodes <- tree.new$leaves
@@ -674,7 +758,7 @@ CART.move.grow <- function(tree, split.prob, memo.writer) {
     rule <- CART.select.rule(selected.node)
     if (!is.null(rule) && CART.set.rule(selected.node, rule)) {
       selected.node$RemoveAttribute('memo')
-      Do(selected.node$children, memo.writer)
+      Do(selected.node$children, after.move)
       break
     }
     terminal.nodes <- terminal.nodes[-selected.node.idx]
@@ -693,7 +777,7 @@ CART.move.grow <- function(tree, split.prob, memo.writer) {
   ))
 }
 
-CART.move.prune <- function(tree, split.prob, memo.writer) {
+CART.move.prune <- function(tree, split.prob, after.move) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
@@ -713,7 +797,7 @@ CART.move.prune <- function(tree, split.prob, memo.writer) {
     print("Warning: Pruned not 2")
   l.prob.sel.split <- CART.prob.rule(selected.node)
   selected.node$RemoveAttribute('split.rule')
-  memo.writer(selected.node)
+  after.move(selected.node)
   
   return(list(
     tree.new=tree.new,
@@ -722,7 +806,7 @@ CART.move.prune <- function(tree, split.prob, memo.writer) {
   ))
 }
 
-CART.move.change <- function(tree, split.prob, memo.writer, only.value=F, max.try=100) {
+CART.move.change <- function(tree, split.prob, after.move, only.value=F, max.try=100) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
@@ -764,7 +848,7 @@ CART.move.change <- function(tree, split.prob, memo.writer, only.value=F, max.tr
     } else {
       tree.new <- subtree
     }
-    subtree$Do(memo.writer, filterFun = isLeaf)
+    subtree$Do(after.move, filterFun = isLeaf)
     break
   }
   if (!ok)
@@ -776,7 +860,7 @@ CART.move.change <- function(tree, split.prob, memo.writer, only.value=F, max.tr
   ))
 }
 
-CART.move.swap <- function(tree, split.prob, memo.writer, max.try=100) {
+CART.move.swap <- function(tree, split.prob, after.move, max.try=100) {
   if (tree$leafCount < 3) {
     return(NULL)
   }
@@ -826,7 +910,7 @@ CART.move.swap <- function(tree, split.prob, memo.writer, max.try=100) {
     } else {
       tree.new <- subtree
     }
-    subtree$Do(memo.writer, filterFun = isLeaf)
+    subtree$Do(after.move, filterFun = isLeaf)
     break
   }
   if (!ok)
