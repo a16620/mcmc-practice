@@ -104,8 +104,8 @@ extract.marginal.params <- function(model, uniform=0) {
       a <- uniform
       b <- uniform
     } else {
-      a <- sum(data[,1]) #shape
-      b <- sum(data[,2]) #rate
+      a <- mean(data[,1]) #shape
+      b <- mean(data[,2]) #rate
     }
     
     return(list(
@@ -222,6 +222,13 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, param$split.prob)
         l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
         l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
+        if(length(l.a.ratio.u-l.a.ratio.l) == 0) {
+          print(mc.new$l.prob.rev)
+          print(mc.new$l.prob)
+          print(burn.in.l.post.new)
+          print(burn.in.l.post)
+          print(mc.move)
+        }
         
         if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
           mtree <- mc.new$tree.new
@@ -246,7 +253,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   selected.model.score <- criteria.matrix[1, model.select.criteria]
   
   print.intval <- if (iteration < 20) iteration else as.integer(iteration*0.1)
-  
+
   accept.count <- setNames(rep(0, length(moves)), moves)
   fail.count <- setNames(rep(0, length(moves)), moves)
   for (iter in 2:iteration) {
@@ -340,26 +347,21 @@ CART.prob.prior <- function(tree, split.prob) {
   sum(log(ifelse(node.info[2,], 1-node.prob, node.prob)))
 }
 
-CART.prob.select.rule <- function(obs, len.rule.values, is.categorical) {
-  if (len.rule.values <= 1 || is.na(len.rule.values)) {
-    return(0)
-  }
-  if (is.categorical) {
-    return(-log(2**len.rule.values-2)-log(ncol(obs)-1))
-  } else {
-    return(-log(len.rule.values)-log(ncol(obs)-1))
-  }
-}
-
 CART.prob.rule <- function(node) {
-  obs <- CART.get.obs.deps(node)
-  rule.colname <- node$split.rule$rule.col
-  if (is.factor(obs[,rule.colname])) {
-    len.rule.values <- length(unique(obs[,rule.colname]))
-    return(CART.prob.select.rule(obs, len.rule.values, T))
+  rule <- node$split.rule
+  rule.val <- CART.get.obs.deps(node)
+  len.rule.values <- nrow(rule.val)
+  if (len.rule.values <= 1)
+    return(0)
+  
+  lp.select.col <- -log(ncol(rule.val))
+  rule.col.val <- rule.val[,rule$split.col]
+  if (is.factor(rule.col.val)) {
+    lp.select.val <- -log(max(2**length(unique(rule.col.val))-2, 1))
   } else {
-    return(CART.prob.select.rule(obs, nrow(obs)-1, F))
+    lp.select.val <- 0.6931472-log(len.rule.values)-log(len.rule.values-1)+rule$l.aux
   }
+  return(lp.select.val+lp.select.col)
 }
 
 ##################### Probability marginal #####################
@@ -553,21 +555,29 @@ CART.select.rule <- function(node, col.candidates=NULL) {
       )
     } else {
       rule.values <- obs.deps[,rule.colname]
-      filt.values <- rule.values[rule.values < max(rule.values)]
-      len.filt.values <- length(filt.values)
+      len.rule.values <- length(rule.values)
       
-      
-      if (len.filt.values <= 2) {
+      if (len.rule.values < 2 || min(rule.values) == max(rule.values)) {
         col.candidates <- col.candidates[col.candidates != rule.colname]
         next
       }
       
-      val.idx <- sample(1:len.filt.values, 1)
-      rule.value <- runif(1, min=filt.values[val.idx], max=min(rule.values[rule.values > filt.values[val.idx]]))
+      smp <- sample(rule.values, 2)
+      l.bound <- min(smp)
+      u.bound <- max(smp)
+      
+      aux.param <- mean(rule.values >= mean(smp))
+      u.aux <- rbeta(1, aux.param, 1)
+      
+      l.aux <- if (l.bound == u.bound) 0 else (dbeta(u.aux, aux.param, 1, log=T)-log(u.bound-l.bound))
+      rule.value <- l.bound+(u.bound-l.bound)*u.aux
+      #rule.value <- runif(1, l.bound, u.bound)
+      #l.aux <- dunif(rule.value, l.bound, u.bound, log=T)
       return(
         list(
           split.col=rule.colname,
-          split.value=rule.value
+          split.value=rule.value,
+          l.aux=l.aux
         )
       )
     }
@@ -655,7 +665,7 @@ CART.move.grow <- function(tree, split.prob, memo.writer) {
   tree.new <- Clone(tree)
   
   terminal.nodes <- tree.new$leaves
-  node.level <- sapply(terminal.nodes, function(node) node$level)
+  node.level <- unname(vapply(terminal.nodes, function(node) node$level, numeric(1)))
   node.prob <- as.probability(split.prob(node.level))
   
   while (length(terminal.nodes) > 0) {
@@ -692,7 +702,7 @@ CART.move.prune <- function(tree, split.prob, memo.writer) {
   parent.of <- Traverse(tree.new, filterFun = function(node) {
     isNotLeaf(node) && isLeaf(node$children[[1]]) && isLeaf(node$children[[2]])
   })
-  node.level <- sapply(parent.of, function(node) node$level)
+  node.level <- unname(sapply(parent.of, function(node) node$level))
   node.prob.rev <- as.probability(split.prob(node.level))
   node.prob <- as.probability(1/node.prob.rev)
   
@@ -718,7 +728,7 @@ CART.move.change <- function(tree, split.prob, memo.writer, only.value=F, max.tr
   }
   tree.new <- Clone(tree)
   split.node <- Traverse(tree.new, filterFun = isNotLeaf)
-  node.level <- sapply(split.node, function(node) node$level)
+  node.level <- unname(vapply(split.node, function(node) node$level, numeric(1)))
   node.prob <- as.probability(1/split.prob(node.level))
   
   if (length(split.node) == 0)
@@ -774,7 +784,7 @@ CART.move.swap <- function(tree, split.prob, memo.writer, max.try=100) {
   split.node <- Traverse(tree.new, filterFun = function(node) {
     isNotLeaf(node) && (isNotLeaf(node$children[[1]]) || isNotLeaf(node$children[[2]]))
   })
-  node.level <- sapply(split.node, function(node) node$level)
+  node.level <- vapply(split.node, function(node) node$level, numeric(1))
   node.prob <- as.probability(1/split.prob(node.level))
   
   if (length(split.node) == 0)
