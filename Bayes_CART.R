@@ -99,7 +99,7 @@ extract.marginal.params <- function(model, uniform=0) {
       nu=length(unique(fit.tree$where)),
       y.cont=T
     ))
-  } else if (method == "poisson") {
+  } else if (method %in% c("poisson", "nb")) {
     if (uniform != 0) {
       a <- uniform
       b <- uniform
@@ -140,41 +140,41 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
   if (model$method == "category") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.category(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.category(marginal.param)
-    
     mcmc.param$crit.loss <- "miscl"
     mcmc.param$crit.fn <- CART.criteria.train.miscl
+    
   } else if (model$method == "normal") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.regression(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.regression(marginal.param)
-    
     mcmc.param$crit.loss <- "SSE"
     mcmc.param$crit.fn <- CART.criteria.train.SSE
+    
   } else if (model$method == "poisson") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.poisson(marginal.param)
-    
     mcmc.param$crit.loss <- "DIC"
     mcmc.param$crit.fn <- CART.criteria.DIC
+    
   } else if (model$method == "nb") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.NB(marginal.param)
-    
     mcmc.param$crit.loss <- "DIC"
     mcmc.param$crit.fn <- CART.criteria.DIC
+    
   } else if (model$method == "zip") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.poisson(marginal.param)
-    
     mcmc.param$crit.loss <- "DIC"
     mcmc.param$crit.fn <- CART.criteria.DIC
+    
   }
   
-  mcmc.param$use.latent <- !(marginal.only || model$method %in% c("category", "normal", "poisson"))
-
-  if (mcmc.param$use.latent) {
+  mcmc.param$use.augment <- model$method %in% c("nb", "zip")
+  if (mcmc.param$use.augment) {
     if (model$method == "nb") {
-      mcmc.param$latent.sampler <- CART.latent.param.sampler.NB
-      mcmc.param$latent.init <- CART.latent.param.initializer.NB(marginal.param)
+      mcmc.param$augment.sampler <- CART.augment.sampler.NB
+      mcmc.param$augment.init <- CART.augment.initialzer.NB(marginal.param)
+      
     } else if (model$method == "zip") {
       
     }
@@ -184,7 +184,7 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
 }
 
 do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
-                    moves=c("grow", "prune", "change", "swap"), prob.moves=NULL,
+                    moves=c("grow", "prune", "change", "swap"), prob.moves=NULL, use.adaptive=F,
                     verbose=F, plot.trace=T, additional.criteria=NULL, additional.criteria.fun=NULL, model.select.criteria=NULL) {
   stopifnot(length(moves) > 0)
   stopifnot(length(additional.criteria) == length(additional.criteria.fun))
@@ -214,29 +214,38 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   mtree <- Clone(model0$tree)
   stopifnot(CART.check.tree.ok(mtree))
   
-  use.latent <- param$use.latent
-  if (use.latent) {
-    latent.sampler <- param$latent.sampler
-    Do(mtree$leaves, param$latent.init)
+  use.augment <- param$use.augment
+  if (use.augment) {
+    augment.sampler <- param$augment.sampler
+    param$augment.init(mtree)
+  } else {
+    augment.sampler <- NULL
   }
   Do(mtree$leaves, after.move)
+  
+  if (use.adaptive) {
+    if (is.null(prob.moves))
+      prob.moves <- as.probability(rep(1, length(moves)))
+    prob.moves0 <- prob.moves
+  }
   
   #burn in
   if (burn.in > 0) {
     if (verbose) {
       cat("burn-in...")
     }
+    accept.count <- setNames(rep(0, length(moves)), moves)
     burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, param$split.prob)
     for (iter in 1:burn.in) {
       mc.move <- sample(moves, 1, prob = prob.moves)
       if (mc.move == "grow") {
-        mc.new <- CART.move.grow(mtree, split.prob, after.move)
+        mc.new <- CART.move.grow(mtree, split.prob, after.move, augment.sampler)
       } else if (mc.move == "prune") {
-        mc.new <- CART.move.prune(mtree, split.prob, after.move)
+        mc.new <- CART.move.prune(mtree, split.prob, after.move, augment.sampler)
       } else if (mc.move == "change") {
-        mc.new <- CART.move.change(mtree, split.prob, after.move, only.value = (runif(1) < 0.5))
+        mc.new <- CART.move.change(mtree, split.prob, after.move, augment.sampler, only.value = (runif(1) < 0.5))
       } else if (mc.move == "swap") {
-        mc.new <- CART.move.swap(mtree, split.prob, after.move)
+        mc.new <- CART.move.swap(mtree, split.prob, after.move, augment.sampler)
       }
       
       if (!is.null(mc.new) && CART.check.tree.ok(mc.new$tree.new)) {
@@ -245,12 +254,14 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
         
         if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
+          accept.count[mc.move] <- accept.count[mc.move] + 1
           mtree <- mc.new$tree.new
           burn.in.l.post <- burn.in.l.post.new
         }
-        
-        if (use.latent)
-          CART.latent.param.sampling(mtree, latent.sampler)
+      }
+      
+      if (use.adaptive) {
+        prob.moves <- (prob.moves0+accept.count/iter)/2#(prob.moves0+accept.count)/(iter+1)
       }
     }
     if (verbose) {
@@ -276,13 +287,13 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   for (iter in 2:iteration) {
     mc.move <- sample(moves, 1, prob = prob.moves)
     if (mc.move == "grow") {
-      mc.new <- CART.move.grow(mtree, split.prob, after.move)
+      mc.new <- CART.move.grow(mtree, split.prob, after.move, augment.sampler)
     } else if (mc.move == "prune") {
-      mc.new <- CART.move.prune(mtree, split.prob, after.move)
+      mc.new <- CART.move.prune(mtree, split.prob, after.move, augment.sampler)
     } else if (mc.move == "change") {
-      mc.new <- CART.move.change(mtree, split.prob, after.move, only.value = (runif(1) < 0.5))
+      mc.new <- CART.move.change(mtree, split.prob, after.move, augment.sampler, only.value = (runif(1) < 0.5))
     } else if (mc.move == "swap") {
-      mc.new <- CART.move.swap(mtree, split.prob, after.move)
+      mc.new <- CART.move.swap(mtree, split.prob, after.move, augment.sampler)
     }
     
     if (is.null(mc.new) || !CART.check.tree.ok(mc.new$tree.new)) {
@@ -305,8 +316,10 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         criteria.new.tree <- criteria.matrix[iter-1,]
       }
     }
-    if (use.latent)
-      CART.latent.param.sampling(mtree, latent.sampler)
+    
+    if (use.adaptive) {
+      prob.moves <- (prob.moves0+accept.count/iter)/2
+    }
     
     criteria.matrix[iter,] <- criteria.new.tree
     
@@ -377,7 +390,7 @@ CART.prob.rule <- function(node) {
   lp.select.col <- -log(ncol(rule.val))
   rule.col.val <- rule.val[,rule$split.col]
   if (is.factor(rule.col.val)) {
-    lp.select.val <- -log(max(2**length(unique(rule.col.val))-2, 1))
+    lp.select.val <- -log(max(2**length(levels(rule.col.val))-2, 1)) #unique or levels
   } else {
     lp.select.val <- 0.6931472-log(len.rule.values)-log(len.rule.values-1)+rule$l.aux
   }
@@ -446,19 +459,43 @@ CART.criteria.DIC <- function(tree) {
   sum(vapply(tree$leaves, function(node) node$memo[2], numeric(1)))
 }
 
-##################### Latent #####################
+##################### Augment #####################
 
-CART.latent.param.sampling <- function(tree, sampler) {
+CART.augment.param.sampling <- function(tree, sampler) {
   Do(tree$leaves, sampler)
 }
 
-CART.latent.param.sampler.NB <- function(node) {
-  node$latent.param <- rgamma(1, node$memo[3], node$memo[4])
+CART.augment.sampler.NB <- function(node) {
+  node.obs <- CART.get.obs.pred(node)
+  N.t <- node.obs[,1]
+  v.t <- node.obs[,2]
+  K.t <- node$memo[3]
+  lambda.t <- node$memo[4]
+  
+  xi.t <- rgamma(nrow(node.obs), K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
+  CART.set.augment.obs(node, xi.t)
 }
 
-CART.latent.param.initializer.NB <- function(params) {
-  function(node) {
-    node$latent.param <- rgamma(1, params$a, params$b)
+CART.augment.initialzer.NB <- function(params) {
+  function (tree) {
+    CART.init.augment(tree, 1)
+    Do(tree$leaves, function(node) {
+      node.obs <- CART.get.obs.pred(node)
+      N.t <- node.obs[,1]
+      v.t <- node.obs[,2]
+      N.sum <- sum(N.t)
+      v.sum <- sum(v.t)
+      n.t <- nrow(node.obs)
+      
+      lambda.est.t <- N.sum/v.sum
+      V.est.t2 <- 1/(n.t-1)*sum(v.t*(N.t/v.t-lambda.est.t)**2)
+      K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
+      
+      lambda.t <- rgamma(1, params$a, params$b)
+      
+      xi.t <- rgamma(nrow(node.obs), K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
+      CART.set.augment.obs(node, xi.t)
+    })
   }
 }
 
@@ -522,34 +559,36 @@ CART.memo.NB <- function(params) {
     n.t <- nrow(node.obs)
 
     lambda.est.t <- N.sum/v.sum
-    V.est.t2 <- 1/(n.t-1)*sum(v.t*(N.t/v.t-lambda.est.t)**2)
-    K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
+    V.est.t2 <- sum(v.t*(N.t/v.t-lambda.est.t)**2)/(n.t-1)
+    K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)#/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
 
-    #latent
-    lambda.t <- node$latent.param
-    xi.t <- rgamma(n.t, K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
-    CART.set.latent.obs(node, xi.t)
-
+    xi.t <- CART.get.augment.obs(node)
+    
+    if (K.t <= 0) {
+      stop("negative K (Do poisson)")
+    }
     #memo
     log.v <- log(v.t)
     v.log.v <- sum(v.t*log.v)
     M.1 <- K.t*(log(K.t)*sum(v.t)+K.t*v.log.v)
-    M.2 <- sum(lg(K.t*v.t)+lg(N.t+1))
+    M.2 <- sum(lgamma(K.t*v.t)+lgamma(N.t+1))
     M.3 <- sum((K.t*v.t+N.t-1)*log(xi.t))
     sum.n.a <- sum(N.t)+c.a
     sum.xv.b <- sum(xi.t*v.t)+c.b
-    l.post <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lg(sum.n.a)-sum.n.a*log(sum.xv.b)
+    l.post <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
     nxv.ratio <- sum.n.a/sum.xv.b
     dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+M.2-M.1-M.3+1+
                  2*(log(sum.n.a)-digamma(sum.n.a))*(sum.n.a-c.a) )
-    node$memo <- c(l.post, dic, sum.n.a, sum.xv.b)
+    
+    lambda.t <- rgamma(1, sum.n.a, sum.xv.b)
+    node$memo <- c(l.post, dic, K.t, lambda.t)
   }
 }
 
 ##################### Utility #####################
 
 CART.check.tree.ok <- function(tree) {
-  all(vapply(tree$leaves, function(node) {length(node$obs.idx) > 0}, logical(1)))
+  all(vapply(tree$leaves, function(node) {length(node$obs.idx) >= 2}, logical(1)))
 }
 
 CART.rule2name <- function(obs, split.col, split.value) {
@@ -573,14 +612,19 @@ CART.rule2name <- function(obs, split.col, split.value) {
   }
 }
 
-CART.get.latent.obs <- function(node) {
+CART.get.augment.obs <- function(node) {
   root <- node$root
-  return(root$latents[node$obs.idx, , drop=F])
+  return(root$augments[node$obs.idx, ])
 }
 
-CART.set.latent.obs <- function(node, values) {
+CART.set.augment.obs <- function(node, values) {
   root <- node$root
-  root$full.obs[node$obs.idx, ] <- values
+  root$augments[node$obs.idx, ] <- values
+}
+
+CART.init.augment <- function(tree, ndim) {
+  root <- tree$root
+  root$augments <- matrix(0, nrow=nrow(root$full.obs), ncol=ndim)
 }
 
 CART.get.obs <- function(node) {
@@ -617,7 +661,7 @@ as.probability <- function(unp) {
 
 ##################### Grow #####################
 
-CART.select.rule <- function(node, col.candidates=NULL) {
+CART.select.rule <- function(node, col.candidates=NULL, safe.variance=T) {
   obs.deps <- CART.get.obs.deps(node)
   col.candidates <- if (is.null(col.candidates)) colnames(obs.deps) else col.candidates
   while (length(col.candidates) > 0) {
@@ -639,6 +683,8 @@ CART.select.rule <- function(node, col.candidates=NULL) {
       )
     } else {
       rule.values <- obs.deps[,rule.colname]
+      if (safe.variance)
+        rule.values <- rule.values[rule.values > min(rule.values)]
       len.rule.values <- length(rule.values)
       
       if (len.rule.values < 2 || min(rule.values) == max(rule.values)) {
@@ -745,8 +791,10 @@ CART.compare.rule <- function(rule1, rule2) {
 
 ##################### MCMC moves #####################
 
-CART.move.grow <- function(tree, split.prob, after.move) {
+CART.move.grow <- function(tree, split.prob, after.move, augment.sampler) {
   tree.new <- Clone(tree)
+  if (!is.null(augment.sampler))
+    Do(tree.new$leaves, augment.sampler)
   
   terminal.nodes <- tree.new$leaves
   node.level <- unname(vapply(terminal.nodes, function(node) node$level, numeric(1)))
@@ -755,11 +803,13 @@ CART.move.grow <- function(tree, split.prob, after.move) {
   while (length(terminal.nodes) > 0) {
     selected.node.idx <- sample(1:length(node.prob), 1, prob = node.prob)
     selected.node <- terminal.nodes[[selected.node.idx]]
-    rule <- CART.select.rule(selected.node)
-    if (!is.null(rule) && CART.set.rule(selected.node, rule)) {
-      selected.node$RemoveAttribute('memo')
-      Do(selected.node$children, after.move)
-      break
+    if (length(selected.node$obs.idx) > 5) {
+      rule <- CART.select.rule(selected.node)
+      if (!is.null(rule) && CART.set.rule(selected.node, rule)) {
+        selected.node$RemoveAttribute('memo')
+        Do(selected.node$children, after.move)
+        break
+      }
     }
     terminal.nodes <- terminal.nodes[-selected.node.idx]
     node.prob <- as.probability(node.prob[-selected.node.idx])
@@ -777,11 +827,13 @@ CART.move.grow <- function(tree, split.prob, after.move) {
   ))
 }
 
-CART.move.prune <- function(tree, split.prob, after.move) {
+CART.move.prune <- function(tree, split.prob, after.move, augment.sampler) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
   tree.new <- Clone(tree)
+  if (!is.null(augment.sampler))
+    Do(tree.new$leaves, augment.sampler)
   
   parent.of <- Traverse(tree.new, filterFun = function(node) {
     isNotLeaf(node) && isLeaf(node$children[[1]]) && isLeaf(node$children[[2]])
@@ -806,11 +858,14 @@ CART.move.prune <- function(tree, split.prob, after.move) {
   ))
 }
 
-CART.move.change <- function(tree, split.prob, after.move, only.value=F, max.try=100) {
+CART.move.change <- function(tree, split.prob, after.move, augment.sampler, only.value=F, max.try=100) {
   if (tree$leafCount == 1) {
     return(NULL)
   }
   tree.new <- Clone(tree)
+  if (!is.null(augment.sampler))
+    Do(tree.new$leaves, augment.sampler)
+  
   split.node <- Traverse(tree.new, filterFun = isNotLeaf)
   node.level <- unname(vapply(split.node, function(node) node$level, numeric(1)))
   node.prob <- as.probability(1/split.prob(node.level))
@@ -860,11 +915,14 @@ CART.move.change <- function(tree, split.prob, after.move, only.value=F, max.try
   ))
 }
 
-CART.move.swap <- function(tree, split.prob, after.move, max.try=100) {
+CART.move.swap <- function(tree, split.prob, after.move, augment.sampler, max.try=100) {
   if (tree$leafCount < 3) {
     return(NULL)
   }
   tree.new <- Clone(tree)
+  if (!is.null(augment.sampler))
+    Do(tree.new$leaves, augment.sampler)
+  
   split.node <- Traverse(tree.new, filterFun = function(node) {
     isNotLeaf(node) && (isNotLeaf(node$children[[1]]) || isNotLeaf(node$children[[2]]))
   })
