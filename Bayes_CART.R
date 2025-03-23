@@ -132,18 +132,16 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
   mcmc.param <- list()
   
   if (is.null(split.param)) {
+    split.param <- c(0.95, 0.5)
+  }
+  
+  if (length(split.param) == 1) {
     mcmc.param$split.prob <- function(level) {
-      0.95*level**(-0.5)
+      split.param[1]**level
     }
   } else {
-    if (length(split.param) == 1) {
-      mcmc.param$split.prob <- function(level) {
-        split.param[1]**level
-      }
-    } else {
-      mcmc.param$split.prob <- function(level) {
-        split.param[1]*level**(-split.param[2])
-      }
+    mcmc.param$split.prob <- function(level) {
+      split.param[1]*level**(-split.param[2])
     }
   }
   
@@ -165,19 +163,19 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.poisson(marginal.param)
     mcmc.param$crit.loss <- "DIC"
-    mcmc.param$crit.fn <- CART.criteria.DIC
+    mcmc.param$crit.fn <- CART.criteria.augment.DIC
     
   } else if (model$method == "nb") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.NB(marginal.param)
     mcmc.param$crit.loss <- "DIC"
-    mcmc.param$crit.fn <- CART.criteria.DIC
+    mcmc.param$crit.fn <- CART.criteria.augment.DIC
     
   } else if (model$method == "zip") {
     mcmc.param$tree.marginal <- function(tree) CART.prob.likelihood.marginal.memo(tree, marginal.param)
     mcmc.param$after.move <- CART.memo.ZIP(marginal.param)
     mcmc.param$crit.loss <- "DIC"
-    mcmc.param$crit.fn <- CART.criteria.DIC
+    mcmc.param$crit.fn <- CART.criteria.augment.DIC
     
   }
   
@@ -268,7 +266,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
         burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, param$split.prob)
         l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
         l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
-        
+
         if (log(runif(1)) <= (l.a.ratio.u-l.a.ratio.l)) {
           accept.count[mc.move] <- accept.count[mc.move] + 1
           mtree <- mc.new$tree.new
@@ -378,25 +376,75 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
 ##################### Deploy #####################
 
 deploy <- function(model) {
-  tree <- model$tree
-  if (is.null(tree$full.obs))
+  tree <- model$tree$root
+  if (!is.null(tree$deploy)) {
+    print("Already deployed.", quot=F)
     return()
-  CART.set.predict(tree)
-  CART.clean.obs(tree)
+  }
+  if (model$method == "normal") {
+    tree$deploy <- list(pred.dim=2, attr.name=c("mean", "var"))
+    Do(tree$leaves, function (node) {
+      node.obs <- CART.get.obs.pred(node)[,1]
+      node$deploy.pred <- c(mean(node.obs), var(node.obs))
+    })
+  } else if (model$method == "category") {
+    tree$deploy <- list(pred.dim=2, attr.name=c("class", "prob"))
+    Do(tree$leaves, function (node) {
+      node.obs <- CART.get.obs.pred(node)[,1]
+      pred <- which.max(table(node.obs))
+      node$deploy.pred <- c(names(pred), unname(pred))
+    })
+  } else if (model$method == "poisson") {
+    tree$deploy <- list(pred.dim=1, attr.name=c("lambda"))
+    Do(tree$leaves, function (node) {
+      node$deploy.pred <- node$memo[3]
+    })
+  } else if (model$method == "nb") {
+    tree$deploy <- list(pred.dim=2, attr.name=c("lambda", "K"))
+    Do(tree$leaves, function (node) {
+      node$deploy.pred <- node$memo[5:4]
+    })
+  } else if (model$method == "zip") {
+    tree$deploy <- list(pred.dim=2, attr.name=c("mu", "lambda"))
+    Do(tree$leaves, function (node) {
+      node$deploy.pred <- node$memo[4:5]
+    })
+  }
+  
+  tree$RemoveAttribute('full.obs')
+  tree$RemoveAttribute('pred.dim')
+  if (!is.null(tree$augments))
+    tree$RemoveAttribute('augments')
+  
+  tree$Do(function(node) {
+    if (!is.null(node$memo))
+      node$RemoveAttribute('memo')
+    node$RemoveAttribute('obs.idx')
+  })
 }
 
-Update.prediction <- function(model, new.data) {
+predict <- function(model, obs) {
   tree <- model$tree
-  tree$full.obs <- model.frame(model$formula, new.data)
-  CART.set.obs(tree, 1:nrow(new.data))
-  CART.update.obs(tree)
-  if (!CART.check.tree.ok(tree))
-    return(F)
+  tree$tmp.forward.idx <- 1:nrow(obs)
+  pred.mat <- `colnames<-`(matrix(0, ncol=tree$deploy$pred.dim, nrow=nrow(obs)), tree$deploy$attr.name)
   
-  CART.set.predict(tree)
-  CART.clean.obs(tree) 
+  tree$Do(function(node) {
+    obs.key <- node$split.rule$fun(obs[node$tmp.forward.idx,])
+    
+    left.obs.idx <- node$tmp.forward.idx[obs.key]
+    right.obs.idx <- node$tmp.forward.idx[!obs.key]
+    
+    node$children[[1]]$tmp.forward.idx <- left.obs.idx
+    node$children[[2]]$tmp.forward.idx <- right.obs.idx
+    
+    node$RemoveAttribute('tmp.forward.idx')
+  }, traversal="level", filterFun=isNotLeaf)
   
-  return(T)
+  for (node in tree$leaves) {
+    pred.mat[node$tmp.forward.idx,] <- node$deploy.pred
+    node$RemoveAttribute('tmp.forward.idx')
+  }
+  return(pred.mat)
 }
 
 ##################### Probability #####################
@@ -482,8 +530,12 @@ CART.get.node.train.miscl <- function(node) {
   }
 }
 
-CART.criteria.DIC <- function(tree) {
+CART.criteria.augment.DIC <- function(tree) {
   sum(vapply(tree$leaves, function(node) node$memo[2], numeric(1)))
+}
+
+CART.criteria.augment.lik <- function(tree) {
+  sum(vapply(tree$leaves, function(node) node$memo[3], numeric(1)))
 }
 
 ##################### Augment #####################
@@ -496,8 +548,8 @@ CART.augment.sampler.NB <- function(node) {
   node.obs <- CART.get.obs.pred(node)
   N.t <- node.obs[,1]
   v.t <- node.obs[,2]
-  K.t <- node$memo[3]
-  lambda.t <- node$memo[4]
+  K.t <- node$memo[4]
+  lambda.t <- node$memo[5]
   
   xi.t <- rgamma(nrow(node.obs), K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
   CART.set.augment.obs(node, xi.t)
@@ -531,12 +583,12 @@ CART.augment.sampler.ZIP <- function(node) {
   N.t <- node.obs[,1]
   v.t <- node.obs[,2]
 
-  mu.t <- node$memo[3]
-  lambda.t <- node$memo[4]
+  mu.t <- node$memo[4]
+  lambda.t <- node$memo[5]
   n.t <- nrow(node.obs)
   
   odd.t <- mu.t*exp(-lambda.t*v.t)
-  delta.t <- ifelse(N.t == 0, rbinom(n.t, odd.t/(1+odd.t)), 1)
+  delta.t <- ifelse(N.t == 0, rbinom(n.t, 1, odd.t/(1+odd.t)), 1)
   phi.t <- rexp(n.t, mu.t*v.t+1)
   CART.set.augment.obs(node, cbind(delta.t, phi.t))
 }
@@ -554,7 +606,7 @@ CART.augment.initialzer.ZIP <- function(params) {
       lambda.t <- rgamma(1, params$a2, params$b2)
       
       odd.t <- mu.t*exp(-lambda.t*v.t)
-      delta.t <- ifelse(N.t == 0, rbinom(n.t, odd.t/(1+odd.t)), 1)
+      delta.t <- ifelse(N.t == 0, rbinom(n.t, 1, odd.t/(1+odd.t)), 1)
       phi.t <- rexp(n.t, mu.t*v.t+1)
       CART.set.augment.obs(node, cbind(delta.t, phi.t))
     })
@@ -563,6 +615,7 @@ CART.augment.initialzer.ZIP <- function(params) {
 
 ##################### Memo #####################
 
+#[2] M1 M2
 CART.memo.regression <- function(params) {
   c.mu <- params$mu
   c.a <- params$a
@@ -575,6 +628,7 @@ CART.memo.regression <- function(params) {
   }
 }
 
+#[1] l.prob
 CART.memo.category <- function(params) {
   c.a <- params$a
   c.as <- sum(c.a)
@@ -587,6 +641,7 @@ CART.memo.category <- function(params) {
   }
 }
 
+#[3] l.prob DIC lambda.t
 CART.memo.poisson <- function(params) {
   c.a <- params$a
   c.b <- params$b
@@ -599,14 +654,15 @@ CART.memo.poisson <- function(params) {
     NV.sum <- sum(node.obs[,1]*log(node.obs[,2]))
     lg.sum <- sum(lgamma(node.obs[,1]+1))
     N.sum.a <- N.sum+c.a
-    l.post <- c.C+NV.sum-lg.sum+
+    l.prob <- c.C+NV.sum-lg.sum+
       lgamma(N.sum.a)-(N.sum.a)*log(V.sum+c.b)
     nv.ratio <- N.sum.a/(V.sum+c.b)
     dic <- 2*(nv.ratio*V.sum-log(nv.ratio)*N.sum-NV.sum+lg.sum+2*(log(N.sum.a)-digamma(N.sum.a))*N.sum)
-    node$memo <- c(l.post, dic, nv.ratio)
+    node$memo <- c(l.prob, dic, nv.ratio)
   }
 }
 
+#[5] l.prob DIC data.l.prob K.t lambda.t
 CART.memo.NB <- function(params) {
   c.a <- params$a
   c.b <- params$b
@@ -637,16 +693,17 @@ CART.memo.NB <- function(params) {
     M.3 <- sum((K.t*v.t+N.t-1)*log(xi.t))
     sum.n.a <- sum(N.t)+c.a
     sum.xv.b <- sum(xi.t*v.t)+c.b
-    l.post <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
+    l.prob <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
     nxv.ratio <- sum.n.a/sum.xv.b
     dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+M.2-M.1-M.3+1+
                  2*(log(sum.n.a)-digamma(sum.n.a))*(sum.n.a-c.a) )
     
     lambda.t <- rgamma(1, sum.n.a, sum.xv.b)
-    node$memo <- c(l.post, dic, K.t, lambda.t)
+    node$memo <- c(l.prob, dic, 0, K.t, lambda.t)
   }
 }
 
+#[5] l.prob DIC data.l.prob mu.t, lambda.t
 CART.memo.ZIP <- function(params) {
   c.a1 <- params$a1
   c.b1 <- params$b1
@@ -671,7 +728,7 @@ CART.memo.ZIP <- function(params) {
     mu.bar <- sum.delta.a/(sum(phi.t*v.t)+c.b1)
     lambda.bar <- (sum.delta.N+c.a2)/(sum.delta+c.b2)
     
-    l.prob <- c.C-sum(phi.t)-sum(delta.t*(log(v.t)-lgamma(N.t+1)))+
+    l.prob <- c.C-sum(phi.t)-sum(delta.t*log(v.t))-sum(delta.t*lgamma(N.t+1))+
       lgamma(sum.delta.a)-sum.delta.a*log(sum.v.phi.b)+
       lgamma(sum.delta.N+c.a2)-(sum.delta.N+c.a2)*log(sum.delta+c.b2)
     dic <- 2*(
@@ -683,7 +740,7 @@ CART.memo.ZIP <- function(params) {
     mu.t <- rgamma(1, sum.delta.a, sum.v.phi.b)
     lambda.t <- rgamma(1, sum.delta.N+c.a2, sum.delta+c.b2)
     
-    node$memo <- c(l.prob, dic, mu.t, lambda.t)
+    node$memo <- c(l.prob, dic, 0, mu.t, lambda.t)
   }
 }
 
@@ -746,15 +803,6 @@ CART.get.obs.deps <- function(node) {
 CART.set.obs <- function(node, obs.idx) {
   node$obs.idx <- obs.idx
   return(node)
-}
-
-CART.clean.obs <- function(tree) {
-  tree$RemoveAttribute('full.obs')
-  subtree$RemoveAttribute('pred.dim')
-  nodes <- Traverse(tree)
-  Do(nodes, function(node) {
-    node$RemoveAttribute('obs.idx')
-  })
 }
 
 as.probability <- function(unp) {
