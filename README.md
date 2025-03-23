@@ -1,6 +1,16 @@
 # mcmc-practice
 R code for implementing MCMC and other simulations.
 
+### How to use
+It is just script, not R package. You can load script by 'source' function.
+But it will mess up your environment. I recommend this way.
+```R
+BCART <- new.env()
+source("./Bayes_CART.R", local=BCART)
+
+model0 <- BCART$lapBCART(Y~., "exposure", example.data, method = "zip")
+```
+
 ### Citations
 #### For 'Bayes_GLM.R'
 ```
