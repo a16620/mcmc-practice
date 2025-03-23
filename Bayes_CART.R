@@ -210,12 +210,20 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   
   tree.marginal.lik <- param$tree.marginal
   
-  criteria.name <- append(c("log.post", "n.leaf", crit.loss), additional.criteria)
-  criteria.funs <- setNames(append(list(
+  default.crit.name <- c("log.post", "n.leaf", crit.loss)
+  default.crit.fn <- list(
     function(tree) {tree.marginal.lik(tree)+CART.prob.prior(tree, param$split.prob)},
     function(tree) {tree$leafCount},
     crit.loss.fn
-  ), additional.criteria.fun), criteria.name)
+  )
+  use.augment <- param$use.augment
+  if (use.augment) {
+    default.crit.name <- append(default.crit.name, "aug.llik")
+    default.crit.fn <- append(default.crit.fn, CART.criteria.augment.llik)
+  }
+  
+  criteria.name <- append(default.crit.name, additional.criteria)
+  criteria.funs <- setNames(append(default.crit.fn, additional.criteria.fun), criteria.name)
   
   if (is.null(model.select.criteria))
     model.select.criteria <- crit.loss
@@ -226,7 +234,6 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   mtree <- Clone(model0$tree)
   stopifnot(CART.check.tree.ok(mtree))
   
-  use.augment <- param$use.augment
   if (use.augment) {
     augment.sampler <- param$augment.sampler
     param$augment.init(mtree)
@@ -355,10 +362,12 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   
   criteria.df <- as.data.frame(criteria.matrix)
   if (plot.trace) {
-    print(ggarrange(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
-              ggplot() + geom_line(aes(x=1:iteration, y=criteria.df[,crit.loss]))+xlab('iter')+ylab(crit.loss)+theme_classic(),
-              ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic(),
-              ncol = 1))
+    plot.list <- list(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=log.post))+xlab('iter')+theme_classic(),
+                  ggplot() + geom_line(aes(x=1:iteration, y=criteria.df[,crit.loss]))+xlab('iter')+ylab(crit.loss)+theme_classic(),
+                  ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic())
+    if (use.augment)
+      plot.list <- append(plot.list, list(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=aug.llik))+xlab('iter')+theme_classic()))
+    print(ggarrange(plotlist = plot.list, ncol = 1))
   }
   model0$tree <- selected.model
   return(list(
@@ -378,7 +387,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
 deploy <- function(model) {
   tree <- model$tree$root
   if (!is.null(tree$deploy)) {
-    print("Already deployed.", quot=F)
+    warning("Already deployed.")
     return()
   }
   if (model$method == "normal") {
@@ -402,12 +411,12 @@ deploy <- function(model) {
   } else if (model$method == "nb") {
     tree$deploy <- list(pred.dim=2, attr.name=c("lambda", "K"))
     Do(tree$leaves, function (node) {
-      node$deploy.pred <- node$memo[5:4]
+      node$deploy.pred <- node$memo[5:6]
     })
   } else if (model$method == "zip") {
-    tree$deploy <- list(pred.dim=2, attr.name=c("mu", "lambda"))
+    tree$deploy <- list(pred.dim=2, attr.name=c("lambda", "mu"))
     Do(tree$leaves, function (node) {
-      node$deploy.pred <- node$memo[4:5]
+      node$deploy.pred <- node$memo[6:7]
     })
   }
   
@@ -534,7 +543,7 @@ CART.criteria.augment.DIC <- function(tree) {
   sum(vapply(tree$leaves, function(node) node$memo[2], numeric(1)))
 }
 
-CART.criteria.augment.lik <- function(tree) {
+CART.criteria.augment.llik <- function(tree) {
   sum(vapply(tree$leaves, function(node) node$memo[3], numeric(1)))
 }
 
@@ -641,7 +650,7 @@ CART.memo.category <- function(params) {
   }
 }
 
-#[3] l.prob DIC lambda.t
+#[3] l.prob DIC post.lambda
 CART.memo.poisson <- function(params) {
   c.a <- params$a
   c.b <- params$b
@@ -662,7 +671,7 @@ CART.memo.poisson <- function(params) {
   }
 }
 
-#[5] l.prob DIC data.l.prob K.t lambda.t
+#[6] l.prob DIC data.l.prob lambda.t | post.lambda K.t
 CART.memo.NB <- function(params) {
   c.a <- params$a
   c.b <- params$b
@@ -688,22 +697,27 @@ CART.memo.NB <- function(params) {
     #memo
     log.v <- log(v.t)
     v.log.v <- sum(v.t*log.v)
+    sum.lg.N <- lgamma(N.t+1)
+    sum.lg.kv <- sum(lgamma(K.t*v.t))
     M.1 <- K.t*(log(K.t)*sum(v.t)+K.t*v.log.v)
-    M.2 <- sum(lgamma(K.t*v.t)+lgamma(N.t+1))
     M.3 <- sum((K.t*v.t+N.t-1)*log(xi.t))
     sum.n.a <- sum(N.t)+c.a
     sum.xv.b <- sum(xi.t*v.t)+c.b
-    l.prob <- c.C+M.1+sum(N.t*log.v)-M.2+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
+    l.prob <- c.C+M.1+sum(N.t*log.v)-(sum.lg.N+sum.lg.N)+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
     nxv.ratio <- sum.n.a/sum.xv.b
-    dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+M.2-M.1-M.3+1+
+    dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+(sum.lg.N+sum.lg.N)-M.1-M.3+1+
                  2*(log(sum.n.a)-digamma(sum.n.a))*(sum.n.a-c.a) )
     
     lambda.t <- rgamma(1, sum.n.a, sum.xv.b)
-    node$memo <- c(l.prob, dic, 0, K.t, lambda.t)
+    
+    l.prob.data <- n.t*(lgamma(K.t)+K.t*log(K.t))+sum(lgamma(N.t+K.t))-sum.lg.N+
+      log(lambda.t)*N.sum+sum(N.t*log.v)-sum((K.t+N.t)*log(K.t+v.t*lambda.t))
+    
+    node$memo <- c(l.prob, dic, l.prob.data, lambda.t, sum.n.a/sum.xv.b, K.t)
   }
 }
 
-#[5] l.prob DIC data.l.prob mu.t, lambda.t
+#[7] l.prob DIC data.l.prob mu.t, lambda.t | post.lambda post.mu
 CART.memo.ZIP <- function(params) {
   c.a1 <- params$a1
   c.b1 <- params$b1
@@ -720,19 +734,21 @@ CART.memo.ZIP <- function(params) {
     delta.t <- aug.t[,1]
     phi.t <- aug.t[,2]
     
+    sum.phi.t <- sum(phi.t)
     sum.delta <- sum(delta.t)
     sum.delta.a <- sum.delta+c.a1
     sum.delta.N <- sum(delta.t*N.t)
     sum.v.phi.b <- sum(v.t*phi.t)+c.b1
+    sum.delta.lg.N <- sum(delta.t*lgamma(N.t+1))
     
     mu.bar <- sum.delta.a/(sum(phi.t*v.t)+c.b1)
     lambda.bar <- (sum.delta.N+c.a2)/(sum.delta+c.b2)
     
-    l.prob <- c.C-sum(phi.t)-sum(delta.t*log(v.t))-sum(delta.t*lgamma(N.t+1))+
+    l.prob <- c.C-sum.phi.t-sum(delta.t*log(v.t))-sum.delta.lg.N+
       lgamma(sum.delta.a)-sum.delta.a*log(sum.v.phi.b)+
       lgamma(sum.delta.N+c.a2)-(sum.delta.N+c.a2)*log(sum.delta+c.b2)
     dic <- 2*(
-      sum(log((N.t==0)/(1+mu.bar*v.t)+mu.bar*N.t*lambda.bar**N.t*exp(-lambda.bar)/(1+mu.bar*v.t)/factorial(N.t)))+
+      -sum(log((N.t==0)/(1+mu.bar*v.t)+mu.bar*N.t*lambda.bar**N.t*exp(-lambda.bar)/(1+mu.bar*v.t)/factorial(N.t)))+
         2*((log(sum.delta.a)-digamma(sum.delta.a))*sum.delta+
              (log(sum.delta.N+c.a2)-digamma(sum.delta.N+c.a2))*sum.delta.N
         ))
@@ -740,7 +756,10 @@ CART.memo.ZIP <- function(params) {
     mu.t <- rgamma(1, sum.delta.a, sum.v.phi.b)
     lambda.t <- rgamma(1, sum.delta.N+c.a2, sum.delta+c.b2)
     
-    node$memo <- c(l.prob, dic, 0, mu.t, lambda.t)
+    l.prob.data <- -sum.phi.t*(1+mu.t)+sum.delta*log(mu.t)+sum.delta.N*log(lambda.t)+
+      sum(delta.t*N.t*log(v.t))-sum.delta.lg.N-lambda.t*sum(delta.t*v.t)
+    
+    node$memo <- c(l.prob, dic, l.prob.data, mu.t, lambda.t, lambda.bar, mu.bar)
   }
 }
 
@@ -996,7 +1015,7 @@ CART.move.prune <- function(tree, split.prob, after.move, augment.sampler) {
   selected.node <- parent.of[[selected.node.idx]]
   
   if (Prune(selected.node, function(cn) F) != 2)
-    print("Warning: Pruned not 2")
+    warning("Pruned not 2")
   l.prob.sel.split <- CART.prob.rule(selected.node)
   selected.node$RemoveAttribute('split.rule')
   after.move(selected.node)
