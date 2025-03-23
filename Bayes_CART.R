@@ -557,8 +557,8 @@ CART.augment.sampler.NB <- function(node) {
   node.obs <- CART.get.obs.pred(node)
   N.t <- node.obs[,1]
   v.t <- node.obs[,2]
-  K.t <- node$memo[4]
-  lambda.t <- node$memo[5]
+  K.t <- node$memo[6]
+  lambda.t <- node$memo[4]
   
   xi.t <- rgamma(nrow(node.obs), K.t*v.t+N.t, K.t*v.t+lambda.t*v.t)
   CART.set.augment.obs(node, xi.t)
@@ -566,7 +566,7 @@ CART.augment.sampler.NB <- function(node) {
 
 CART.augment.initialzer.NB <- function(params) {
   function (tree) {
-    CART.init.augment(tree, 2)
+    CART.init.augment(tree, 1)
     Do(tree$leaves, function(node) {
       node.obs <- CART.get.obs.pred(node)
       N.t <- node.obs[,1]
@@ -577,7 +577,12 @@ CART.augment.initialzer.NB <- function(params) {
       
       lambda.est.t <- N.sum/v.sum
       V.est.t2 <- 1/(n.t-1)*sum(v.t*(N.t/v.t-lambda.est.t)**2)
-      K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
+      K.t <- max(lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(v.sum-sum(v.t**2)/v.sum), 0)
+      
+      if (K.t < 0)
+        K.t <- -1/K.t
+      else if (K.t == 0)
+        K.t <- 1e-5
       
       lambda.t <- rgamma(1, params$a, params$b)
       
@@ -681,39 +686,48 @@ CART.memo.NB <- function(params) {
     node.obs <- CART.get.obs.pred(node)
     N.t <- node.obs[,1]
     v.t <- node.obs[,2]
-    N.sum <- sum(N.t)
-    v.sum <- sum(v.t)
+    sum.N <- sum(N.t)
+    sum.V <- sum(v.t)
     n.t <- nrow(node.obs)
-
-    lambda.est.t <- N.sum/v.sum
-    V.est.t2 <- sum(v.t*(N.t/v.t-lambda.est.t)**2)/(n.t-1)
-    K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)#/(n.t-1)*(v.sum-sum(v.t**2)/v.sum)
-
-    xi.t <- CART.get.augment.obs(node)
     
-    if (K.t <= 0) {
-      stop("negative K (Do poisson)")
+    if (sum.N > 0) {
+      lambda.est.t <- sum.N/sum.V
+      V.est.t2 <- sum(v.t*(N.t/v.t-lambda.est.t)**2)/(n.t-1)
+      K.t <- lambda.est.t**2/(V.est.t2-lambda.est.t)/(n.t-1)*(sum.V-sum(v.t**2)/sum.V)
+      if (K.t < 0)
+        K.t <- -1/K.t
+      else if (K.t == 0)
+        K.t <- 1e-5
+    } else {
+      K.t <- 1
     }
+    
+    xi.t <- CART.get.augment.obs(node)
+  
     #memo
     log.v <- log(v.t)
-    v.log.v <- sum(v.t*log.v)
-    sum.lg.N <- lgamma(N.t+1)
+    sum.v.log.v <- sum(v.t*log.v)
+    sum.lg.N <- sum(lgamma(N.t+1))
     sum.lg.kv <- sum(lgamma(K.t*v.t))
-    M.1 <- K.t*(log(K.t)*sum(v.t)+K.t*v.log.v)
+    sum.n.l.v <- sum(N.t*log.v)
+    M.1 <- K.t*(log(K.t)*sum.V+sum.v.log.v)
     M.3 <- sum((K.t*v.t+N.t-1)*log(xi.t))
-    sum.n.a <- sum(N.t)+c.a
+    sum.n.a <- sum.N+c.a
     sum.xv.b <- sum(xi.t*v.t)+c.b
-    l.prob <- c.C+M.1+sum(N.t*log.v)-(sum.lg.N+sum.lg.N)+M.3-K.t*sum(v.t*xi.t)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
+    
+    #NB2
+    l.prob <- c.C+M.1+sum.n.l.v-(sum.lg.N+sum.lg.kv)+M.3-K.t*(sum.xv.b-c.b)+lgamma(sum.n.a)-sum.n.a*log(sum.xv.b)
     nxv.ratio <- sum.n.a/sum.xv.b
-    dic <- 2*( -sum(N.t*(log.v+log(sum.n.a)-log(sum.xv.b)))+ (nxv.ratio+K.t)*(sum.xv.b-c.b)+(sum.lg.N+sum.lg.N)-M.1-M.3+1+
-                 2*(log(sum.n.a)-digamma(sum.n.a))*(sum.n.a-c.a) )
+    dic <- 2*( -sum.n.l.v+(log(sum.xv.b)-log(sum.n.a))*sum.N+nxv.ratio*(sum.xv.b-c.b)+
+                 sum.lg.kv+sum.lg.N-M.1-M.3+K.t*(sum.xv.b-c.b)+
+                 1+2*(log(sum.n.a)-digamma(sum.n.a))*sum.N )
     
     lambda.t <- rgamma(1, sum.n.a, sum.xv.b)
     
-    l.prob.data <- n.t*(lgamma(K.t)+K.t*log(K.t))+sum(lgamma(N.t+K.t))-sum.lg.N+
-      log(lambda.t)*N.sum+sum(N.t*log.v)-sum((K.t+N.t)*log(K.t+v.t*lambda.t))
+    l.prob.data <- sum.N*log(lambda.t)+sum.n.l.v-(lambda.t+K.t)*(sum.xv.b-c.b)+
+      M.1+M.3-(sum.lg.N+sum.lg.kv)
     
-    node$memo <- c(l.prob, dic, l.prob.data, lambda.t, sum.n.a/sum.xv.b, K.t)
+    node$memo <- c(l.prob, dic, l.prob.data, lambda.t, (sum.n.a/sum.xv.b), K.t)
   }
 }
 
@@ -744,6 +758,7 @@ CART.memo.ZIP <- function(params) {
     mu.bar <- sum.delta.a/(sum(phi.t*v.t)+c.b1)
     lambda.bar <- (sum.delta.N+c.a2)/(sum.delta+c.b2)
     
+    #ZIP2
     l.prob <- c.C-sum.phi.t-sum(delta.t*log(v.t))-sum.delta.lg.N+
       lgamma(sum.delta.a)-sum.delta.a*log(sum.v.phi.b)+
       lgamma(sum.delta.N+c.a2)-(sum.delta.N+c.a2)*log(sum.delta+c.b2)
@@ -756,8 +771,8 @@ CART.memo.ZIP <- function(params) {
     mu.t <- rgamma(1, sum.delta.a, sum.v.phi.b)
     lambda.t <- rgamma(1, sum.delta.N+c.a2, sum.delta+c.b2)
     
-    l.prob.data <- -sum.phi.t*(1+mu.t)+sum.delta*log(mu.t)+sum.delta.N*log(lambda.t)+
-      sum(delta.t*N.t*log(v.t))-sum.delta.lg.N-lambda.t*sum(delta.t*v.t)
+    l.prob.data <- -sum.phi.t-(sum.v.phi.b-c.b1)*mu.t+sum.delta*log(mu.t)+sum(delta.t*log(v.t))+
+      sum.delta.N*log(lambda.t)-sum.delta.lg.N
     
     node$memo <- c(l.prob, dic, l.prob.data, mu.t, lambda.t, lambda.bar, mu.bar)
   }
