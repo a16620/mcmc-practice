@@ -39,8 +39,7 @@ BCART <- function(formula, data, method=NULL, print.model=F) {
 lapBCART <- function(formula, rate=NULL, data, method=NULL, print.model=F) {
   combine.df <- model.frame(formula, data)
   if (is.null(rate) || !(rate %in% colnames(data))) {
-    rate <- '.rate.1'
-    combine.df <- data.frame(combine.df[, 1, drop=F], .rate.1=rep(1, nrow(combine.df)), combine.df[, 2:ncol(combine.df), drop=F])
+    combine.df <- data.frame(combine.df[, 1, drop=F], rep(1, nrow(combine.df)), combine.df[, 2:ncol(combine.df), drop=F])
   } else {
     ind <- which(rate == colnames(data))[1]
     combine.df <- data.frame(combine.df[, 1, drop=F], combine.df[, ind, drop=F], combine.df[, -c(1,ind), drop=F])
@@ -54,14 +53,15 @@ lapBCART <- function(formula, rate=NULL, data, method=NULL, print.model=F) {
     return(NULL)
   }
   
+  formula.txt <- paste0(rate, (if (is.null(rate)) NULL else '*'), format(formula))
   if (print.model) {
-    cat(paste0("Model: ", format(formula)), " rate=", rate, " method=", method, sep='')
+    cat(paste0("Model: ", formula.txt, " method=", method, sep=''))
     cat("\nPredictors: ", paste(colnames(combine.df)[-1], collapse=', '), '\n')
   }
   
   model <- list()
   model$formula <- formula
-  model$formula <- rate
+  model$rate <- rate
   model$method <- method
   model$tree <- CART.set.obs(Node$new("Root", full.obs=combine.df, pred.dim=2), 1:nrow(combine.df))
   
@@ -136,12 +136,30 @@ MCMC.param <- function(model, split.param=NULL, marginal.param=NULL, marginal.on
   }
   
   if (length(split.param) == 1) {
-    mcmc.param$split.prob <- function(level) {
-      split.param[1]**level
+    log.gamma <- log(split.param)
+    if (log.gamma > 0)
+      stop("split.param r: 0<r<1")
+    mcmc.param$split.prob.prior <- function(level) {
+      l.p <- level*log.gamma
+      l.p.inv <- ifelse(-0.69 > l.p, -l.p, log(-l.p))
+      if (any(is.na(c(l.p, l.p.inv)))) {
+        print(cbind(l.p, l.p.inv, level))
+      }
+      cbind(l.p, l.p.inv)
+    }
+    mcmc.param$split.prob.select <- function(level) {
+      split.param**level
     }
   } else {
-    mcmc.param$split.prob <- function(level) {
-      split.param[1]*level**(-split.param[2])
+    log.alpha <- log(split.param[1])
+    m.beta <- -split.param[2]
+    mcmc.param$split.prob.prior <- function(level) {
+      l.p <- log.alpha+m.beta*log(level)
+      l.p.inv <- ifelse(-0.69 > l.p, -l.p, log(-l.p))
+      cbind(l.p, l.p.inv)
+    }
+    mcmc.param$split.prob.select <- function(level) {
+      level**m.beta
     }
   }
   
@@ -209,10 +227,11 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   crit.loss.fn <- param$crit.fn
   
   tree.marginal.lik <- param$tree.marginal
+  tree.prior.prob <- param$split.prob.prior
   
   default.crit.name <- c("log.post", "n.leaf", crit.loss)
   default.crit.fn <- list(
-    function(tree) {tree.marginal.lik(tree)+CART.prob.prior(tree, param$split.prob)},
+    function(tree) {tree.marginal.lik(tree)+CART.prob.prior(tree, tree.prior.prob)},
     function(tree) {tree$leafCount},
     crit.loss.fn
   )
@@ -228,7 +247,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
   if (is.null(model.select.criteria))
     model.select.criteria <- crit.loss
   
-  split.prob <- param$split.prob
+  split.prob <- param$split.prob.select
   after.move <- param$after.move
   
   mtree <- Clone(model0$tree)
@@ -255,7 +274,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
     }
     move.count <- setNames(rep(1, length(moves)), moves)
     accept.count <- setNames(rep(0, length(moves)), moves)
-    burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, param$split.prob)
+    burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, tree.prior.prob)
     for (iter in 1:burn.in) {
       mc.move <- sample(moves, 1, prob = prob.moves)
       move.count[mc.move] <- move.count[mc.move]+1
@@ -270,7 +289,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
       }
       
       if (!is.null(mc.new) && CART.check.tree.ok(mc.new$tree.new)) {
-        burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, param$split.prob)
+        burn.in.l.post.new <- tree.marginal.lik(mc.new$tree.new)+CART.prob.prior(mc.new$tree.new, tree.prior.prob)
         l.a.ratio.u <- mc.new$l.prob.rev+burn.in.l.post.new
         l.a.ratio.l <- mc.new$l.prob+burn.in.l.post
 
@@ -280,7 +299,7 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
           burn.in.l.post <- burn.in.l.post.new
         } else if (use.augment) {
           CART.set.augment.obs(mtree, CART.get.augment.obs(mc.new$tree.new))
-          burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, param$split.prob)
+          burn.in.l.post <- tree.marginal.lik(mtree)+CART.prob.prior(mtree, tree.prior.prob)
         }
       }
       
@@ -367,7 +386,8 @@ do.MCMC <- function(model0, param=NULL, iteration=1000, burn.in=0,
                   ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=n.leaf))+xlab('iter')+theme_classic())
     if (use.augment)
       plot.list <- append(plot.list, list(ggplot(criteria.df) + geom_line(aes(x=1:iteration, y=aug.llik))+xlab('iter')+theme_classic()))
-    print(ggarrange(plotlist = plot.list, ncol = 1))
+    plot.title <- paste0(model0$method, ':', model0$rate, (if (is.null(model0$rate)) NULL else '*'), format(model0$formula))
+    print(annotate_figure(ggarrange(plotlist = plot.list, ncol = 1), top=text_grob(plot.title, face='bold')))
   }
   model0$tree <- selected.model
   return(list(
@@ -461,7 +481,7 @@ predict <- function(model, obs) {
 CART.prob.prior <- function(tree, split.prob) {
   node.info <- tree$Get(function(node) c(node$level, isLeaf(node)), simplify = T)
   node.prob <- split.prob(node.info[1,])
-  sum(log(ifelse(node.info[2,], 1-node.prob, node.prob)))
+  sum(ifelse(node.info[2,], node.prob[,1], node.prob[,2]))
 }
 
 CART.prob.rule <- function(node) {
