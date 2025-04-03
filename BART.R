@@ -3,7 +3,7 @@ library(pracma)
 library(invgamma)
 library(parallel)
 
-BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.in=0) {
+BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.in=0, compress.type=1) {
   #Y transform
   y.range <- max(y)-min(y)
   y.shift <- min(y)
@@ -33,6 +33,13 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.i
   
   if (tree.prior[2] > 0)
     tree.prior[2] <- -tree.prior[2]
+  
+  if (compress.type == 2) {
+    col.dict <- setNames(1:ncol(x), colnames(x))
+    compressor <- compress.DT2(col.dict)
+  } else {
+    compressor <- compress.DT
+  }
   
   #MCMC
   R0 <- rep(0, y.len)
@@ -103,7 +110,7 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.i
     mcmc.trees <- mcmc.trees.next
     
     sigma.trace[iter] <- mcmc.sigma
-    tree.store[[iter]] <- lapply(mcmc.trees, compress.DT)
+    tree.store[[iter]] <- lapply(mcmc.trees, compressor)
   }
   
   list(
@@ -118,6 +125,7 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F) {
   if (parallel) {
     n.core <- parallel::detectCores()
     cl <- parallel::makeCluster(n.core)
+    clusterExport(cl, varlist = c("x"), envir = environment())
     
     batch.pred <- parallel::parSapply(cl, bart$trees, function(trees) {
       #한 세트의 트리 각각 예측값을 얻는다.
@@ -151,6 +159,58 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F) {
               cursor <- cursor$right
           }
           return(cursor$node.param)
+        })
+      }, numeric(nrow(x))))
+    }, numeric(nrow(x)))
+  }
+  
+  if (raw.mat) {
+    return(batch.pred)
+  }
+  
+  batch.summary <- t(apply(batch.pred, 1, function(obs.preds) {
+    c(mean(obs.preds), quantile(obs.preds, probs = c(.05, .95), names=F))
+  }))
+  
+  `colnames<-`((batch.summary+0.5)*bart$y.range+bart$y.shift, c('mean', '5%', '95%'))
+}
+
+Predict.compress2 <- function(bart, x, raw.mat=F, parallel=F) {
+  if (parallel) {
+    n.core <- parallel::detectCores()
+    cl <- parallel::makeCluster(n.core)
+    clusterExport(cl, varlist = c("x"), envir = environment())
+    
+    batch.pred <- parallel::parSapply(cl, bart$trees, function(trees) {
+      #한 세트의 트리 각각 예측값을 얻는다.
+      rowSums(vapply(trees, function(tree) {
+        apply(x, 1, function(row) {
+          cursor <- tree[1,]
+          while (!is.na(cursor[1])) {
+            if (row[cursor[1]] <= cursor[2])
+              cursor <- tree[cursor[3],]
+            else
+              cursor <- tree[cursor[3]+1,]
+          }
+          return(cursor[2])
+        })
+      }, numeric(nrow(x))))
+    })
+    
+    parallel::stopCluster(cl)
+  } else {
+    batch.pred <- vapply(bart$trees, function(trees) {
+      #한 세트의 트리 각각 예측값을 얻는다.
+      rowSums(vapply(trees, function(tree) {
+        apply(x, 1, function(row) {
+          cursor <- tree[1,]
+          while (!is.na(cursor[1])) {
+            if (row[cursor[1]] <= cursor[2])
+              cursor <- tree[cursor[3],]
+            else
+              cursor <- tree[cursor[3]+1,]
+          }
+          return(cursor[2])
         })
       }, numeric(nrow(x))))
     }, numeric(nrow(x)))
@@ -411,4 +471,32 @@ sample.safe.name <- function(x, n) {
 
 compress.DT <- function(tree) {
   as.list(tree, keepOnly = c('split.rule', 'rule.name', 'node.param'))
+}
+
+compress.DT2 <- function(col.dict) {
+  compressor <- function(tree) {
+    trv <- Traverse(tree, traversal = "level")
+    Set(trv, nid=1:length(trv))
+    len.trv <- length(trv)
+    
+    split.col  <- numeric(len.trv)
+    split.val  <- numeric(len.trv)
+    child.left <- integer(len.trv)
+    
+    for (nid in 1:len.trv) {
+      node <- trv[[nid]]
+      if (isNotLeaf(node)) {
+        split.col[nid]  <- col.dict[names(node$split.rule)]
+        split.val[nid]  <- node$split.rule
+        child.left[nid] <- node$left$nid
+      } else {
+        split.col[nid]  <- NA
+        split.val[nid]  <- node$node.param
+        child.left[nid] <- NA
+      }
+      
+      node$RemoveAttribute('nid')
+    }
+    return(cbind(split.col,split.val,child.left))
+  }
 }
