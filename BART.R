@@ -1,6 +1,7 @@
 library(data.tree)
 library(pracma)
 library(invgamma)
+library(parallel)
 
 BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.in=0) {
   #Y transform
@@ -113,26 +114,54 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), iteration, burn.i
     )
 }
 
-Predict.compress <- function(bart, x) {
-  batch.pred <- vapply(bart$trees, function(trees) {
-    #한 세트의 트리 각각 예측값을 얻는다.
-    rowSums(vapply(trees, function(tree) {
-      apply(x, 1, function(row) {
-        cursor <- tree
-        while (is.null(cursor$node.param)) {
-          rule <- cursor$split.rule
-          if (row[names(rule)] <= rule)
-            cursor <- cursor$left
-          else
-            cursor <- cursor$right
-        }
-        return(cursor$node.param)
-      })
-    }, numeric(nrow(x))))
-  }, numeric(nrow(x)))
+Predict.compress <- function(bart, x, raw.mat=F, parallel=F) {
+  if (parallel) {
+    n.core <- parallel::detectCores()
+    cl <- parallel::makeCluster(n.core)
+    
+    batch.pred <- parallel::parSapply(cl, bart$trees, function(trees) {
+      #한 세트의 트리 각각 예측값을 얻는다.
+      rowSums(vapply(trees, function(tree) {
+        apply(x, 1, function(row) {
+          cursor <- tree
+          while (is.null(cursor$node.param)) {
+            rule <- cursor$split.rule
+            if (row[names(rule)] <= rule)
+              cursor <- cursor$left
+            else
+              cursor <- cursor$right
+          }
+          return(cursor$node.param)
+        })
+      }, numeric(nrow(x))))
+    })
+    
+    parallel::stopCluster(cl)
+  } else {
+    batch.pred <- vapply(bart$trees, function(trees) {
+      #한 세트의 트리 각각 예측값을 얻는다.
+      rowSums(vapply(trees, function(tree) {
+        apply(x, 1, function(row) {
+          cursor <- tree
+          while (is.null(cursor$node.param)) {
+            rule <- cursor$split.rule
+            if (row[names(rule)] <= rule)
+              cursor <- cursor$left
+            else
+              cursor <- cursor$right
+          }
+          return(cursor$node.param)
+        })
+      }, numeric(nrow(x))))
+    }, numeric(nrow(x)))
+  }
+  
+  if (raw.mat) {
+    return(batch.pred)
+  }
   
   batch.summary <- t(apply(batch.pred, 1, function(obs.preds) {
-    c(mean(obs.preds), quantile(obs.preds, probs = c(.5, .95), names=F))
+    c(mean(obs.preds), quantile(obs.preds, probs = c(.05, .95), names=F))
   }))
   
   `colnames<-`((batch.summary+0.5)*bart$y.range+bart$y.shift, c('mean', '5%', '95%'))
@@ -190,7 +219,6 @@ BART.move.grow <- function(tree, x, y, tree.prior, lik.prior, sigma) {
     grow.node$RemoveAttribute('node.param')
     #grow.node$RemoveAttribute('obs.idx')
   } else {
-    tree.proposed <- tree
     l.proposal <- -Inf
     l.prior <- 0
     l.lik <- 0
@@ -280,7 +308,6 @@ BART.move.change <- function(tree, x, y, lik.prior, sigma) {
     len.can.change <- len.can.change-1
   }
   if (len.can.change == 0) {
-    tree.proposed <- tree
     l.lik <- -Inf
   } else
     l.lik <- llik.node(change.node$leaves, y, lik.prior, sigma)-change.node.llik.before
