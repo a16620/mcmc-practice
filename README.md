@@ -32,3 +32,15 @@ Yaojun Zhang, Lanpeng Ji, Georgios Aivaliotis, Charles Taylor,
 Bayesian CART models for insurance claims frequency,
 Insurance: Mathematics and Economics, Volume 114, 2024, Pages 108-131.
 ```
+
+#### For 'RJMCMC'
+```
+Andrieu, C., de Freitas, N., Doucet, A. et al. An Introduction to MCMC for Machine Learning.
+Machine Learning 50, 5–43 (2003). https://doi.org/10.1023/A:1020281327116
+```
+
+#### For 'BART'
+```
+Hugh A. Chipman. Edward I. George. Robert E. McCulloch. "BART: Bayesian additive regression trees."
+Ann. Appl. Stat. 4 (1) 266 - 298, March 2010. https://doi.org/10.1214/09-AOAS285
+```
