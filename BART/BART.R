@@ -3,7 +3,7 @@ library(pracma)
 library(invgamma)
 library(parallel)
 
-BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NA, iteration, burn.in=0, compress.type='list') {
+BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, iteration, burn.in=0, compress.type='list') {
   #Y transform
   y.range <- max(y)-min(y)
   y.shift <- min(y)
@@ -48,7 +48,7 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NA, ite
   mcmc.sigma <- rinvgamma(1, sigma.prior[1], sigma.prior[2])
   mcmc.trees <- list()
   
-  if (is.na(col.prior)) {
+  if (is.null(col.prior)) {
     MC.MOVE.GROW <- BART.move.grow
     MC.MOVE.PRUNE <- BART.move.prune
     MC.MOVE.CHANGE <- BART.move.change
@@ -246,8 +246,10 @@ Predict.compress2 <- function(bart, x, raw.mat=F, parallel=F) {
 BART.create.single <- function(y, x, lik.prior, sigma, diric.prior) {
   tree <- Node$new("Root", obs.idx = 1:length(y))
   BART.sample.mu(tree, y, lik.prior, sigma)
-  if (!is.na(diric.prior))
-    tree$col.alpha <- setNames(rep(diric.prior, ncol(x)), colnames(x))
+  if (!is.null(diric.prior)) {
+    tree$col.alpha <- setNames(rep(diric.prior[1], ncol(x)), colnames(x))
+    tree$diric.amp <- diric.prior[2]
+  }
   return(tree)
 }
 
@@ -345,7 +347,7 @@ BART.move.grow.diric <- function(tree, x, y, tree.prior, lik.prior, sigma) {
     }, simplify = "array"))
     
     cn <- names(rule.selected)
-    tree.proposed$col.alpha[cn] <- tree.proposed$col.alpha[cn] + 1
+    tree.proposed$col.alpha[cn] <- tree.proposed$col.alpha[cn] + tree.proposed$diric.amp
     
     # rev = 1/n.prune for = 1/n.grow * 1/n.col * 1/n.row
     l.proposal <- log(n.grow)-rule.selected.dir$prob+log(length(grow.node$obs.idx))-log(n.prune)
@@ -424,7 +426,7 @@ BART.move.prune.diric <- function(tree, x, y, tree.prior, lik.prior, sigma) {
   
   cn <- names(prune.node$split.rule)
   c.idx <- which(colnames(x) == cn)[1]
-  tree.proposed$col.alpha[cn] <- tree.proposed$col.alpha[cn] - 1
+  tree.proposed$col.alpha[cn] <- tree.proposed$col.alpha[cn] - tree.proposed$diric.amp
   
   l.proposal <- log(n.prune)-log(tree.proposed$leafCount-1)+prob.sample.diric(c.idx, tree.proposed$col.alpha)-log(length(prune.node$obs.idx))
   l.prior <- -(log(tree.prior[1])+tree.prior[2]*log(grow.depth)-log1p(-tree.prior[1]*grow.depth**tree.prior[2])+2*log1p(-tree.prior[1]*(grow.depth+1)**tree.prior[2]))
@@ -505,7 +507,7 @@ BART.move.change.diric <- function(tree, x, y, lik.prior, sigma) {
     rule.rollback <- change.node$split.rule
     change.node.llik.before <- llik.node(change.node$leaves, y, lik.prior, sigma)
     
-    alpha.before <- tree.proposed$col.alpha - as.integer(colnames(x) == names(rule.rollback))
+    alpha.before <- tree.proposed$col.alpha - as.integer(colnames(x) == names(rule.rollback))*tree.proposed$diric.amp
     
     for (try in 1:50) {
       rule.candidate <- rule.select(change.node, x)
@@ -547,7 +549,7 @@ BART.move.change.diric <- function(tree, x, y, lik.prior, sigma) {
     l.proposal <- prob.sample.diric(c.idx.reverse, alpha.before)-rule.shuffle.dir$prob[i]
     
     cn <- names(change.node$split.rule)
-    alpha.before[cn] <- alpha.before[cn] + 1
+    alpha.before[cn] <- alpha.before[cn] + tree.proposed$diric.amp
     tree.proposed$col.alpha <- alpha.before
   }
   
