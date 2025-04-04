@@ -1,7 +1,20 @@
 library(data.tree)
 library(pracma)
 library(invgamma)
+
+library(foreach)
 library(parallel)
+library(doParallel)
+
+library(dplyr)
+library(ggplot2)
+library(ggridges)
+library(ggpubr)
+
+library(Rcpp)
+
+cpp.func <- new.env()
+Rcpp::sourceCpp("./bart_c_func.cpp", env = cpp.func)
 
 BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, iteration, burn.in=0, compress.type='list') {
   #Y transform
@@ -137,46 +150,37 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, i
     )
 }
 
-Predict.compress <- function(bart, x, raw.mat=F, parallel=F) {
+Predict.partial.dependence <- function(bart, x, predictor.label, x.known) {
+  cl <- makeCluster(detectCores())
+  on.exit(stopCluster(cl))
+  
+  y.output <- vapply(x, function(x.i) {
+    x.known[,predictor.label] <- x.i
+    raw.pred <- Predict.compress(bart, x.known, raw.mat = T, parallel = T, cl)
+    sum(raw.pred)/nrow(raw.pred)
+  }, numeric(1))
+  
+  return(y.output)
+}
+
+Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
   if (parallel) {
-    n.core <- parallel::detectCores()
-    cl <- parallel::makeCluster(n.core)
-    clusterExport(cl, varlist = c("x"), envir = environment())
+    if (is.null(cl)) {
+      clp <- parallel::makeCluster(parallel::detectCores())
+      on.exit(parallel::stopCluster(clp))
+    }
+    else
+      clp <- cl
     
-    batch.pred <- parallel::parSapply(cl, bart$trees, function(trees) {
+    #clusterExport(clp, varlist = c("x", "cpp.func"), envir = environment())
+    batch.pred <- foreach(tree.set=bart$trees, .combine = cbind) %do% {
       #한 세트의 트리 각각 예측값을 얻는다.
-      rowSums(vapply(trees, function(tree) {
-        apply(x, 1, function(row) {
-          cursor <- tree
-          while (is.null(cursor$node.param)) {
-            rule <- cursor$split.rule
-            if (row[names(rule)] <= rule)
-              cursor <- cursor$left
-            else
-              cursor <- cursor$right
-          }
-          return(cursor$node.param)
-        })
-      }, numeric(nrow(x))))
-    })
-    
-    parallel::stopCluster(cl)
+      cpp.func$C_predict_single_set(X2, tree.set)
+    }
   } else {
-    batch.pred <- vapply(bart$trees, function(trees) {
+    batch.pred <- vapply(bart$trees, function(tree.set) {
       #한 세트의 트리 각각 예측값을 얻는다.
-      rowSums(vapply(trees, function(tree) {
-        apply(x, 1, function(row) {
-          cursor <- tree
-          while (is.null(cursor$node.param)) {
-            rule <- cursor$split.rule
-            if (row[names(rule)] <= rule)
-              cursor <- cursor$left
-            else
-              cursor <- cursor$right
-          }
-          return(cursor$node.param)
-        })
-      }, numeric(nrow(x))))
+      C_predict_single_set(x, tree.set)
     }, numeric(nrow(x)))
   }
   
@@ -191,12 +195,16 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F) {
   `colnames<-`((batch.summary+0.5)*bart$y.range+bart$y.shift, c('mean', '5%', '95%'))
 }
 
-Predict.compress2 <- function(bart, x, raw.mat=F, parallel=F) {
+Predict.compress2 <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
   if (parallel) {
-    n.core <- parallel::detectCores()
-    cl <- parallel::makeCluster(n.core)
-    clusterExport(cl, varlist = c("x"), envir = environment())
+    if (is.null(cl)) {
+      clp <- parallel::makeCluster(parallel::detectCores())
+      on.exit(parallel::stopCluster(clp))
+    }
+    else
+      clp <- cl
     
+    clusterExport(clp, varlist = c("x"), envir = environment())
     batch.pred <- parallel::parSapply(cl, bart$trees, function(trees) {
       #한 세트의 트리 각각 예측값을 얻는다.
       rowSums(vapply(trees, function(tree) {
@@ -213,7 +221,8 @@ Predict.compress2 <- function(bart, x, raw.mat=F, parallel=F) {
       }, numeric(nrow(x))))
     })
     
-    parallel::stopCluster(cl)
+    if (is.null(cl))
+      parallel::stopCluster(clp)
   } else {
     batch.pred <- vapply(bart$trees, function(trees) {
       #한 세트의 트리 각각 예측값을 얻는다.
@@ -695,4 +704,51 @@ sample.with.diric <- function(x, a, n=1, sum.a=NA) {
 prob.sample.diric <- function(x.idx, a) {
   sum.a <- sum(a)
   lgamma(a[x.idx]+1)-lgamma(sum.a+1)+lgamma(sum.a)-lgamma(a[x.idx])
+}
+
+fetch.bart.variable <- function(bart) {
+  tree.chain <- bart$trees
+  chain.len <- length(tree.chain)
+  m <- length(tree.chain[[1]])
+  
+  cl <- makeCluster(detectCores())
+  registerDoParallel(cl)
+  
+  res <- foreach(iter=icount(chain.len), .combine = rbind) %:%
+    foreach(k=icount(m), .combine = rbind) %do% {
+      tree.k <- tree.chain[[iter]][[k]]
+      df.rw <- cpp.func$C_summary_tree(tree.k)
+      if (nrow(df.rw) == 0)
+        NULL
+      else
+        data.frame(k=k, cpp.func$C_summary_tree(tree.k))
+    }
+  stopCluster(cl)
+  return(res)
+}
+
+plot.bart.variable <- function(bart, sum.by.tree=F) {
+  res <- fetch.bart.variable(bart)
+  if (sum.by.tree) {
+    plt.var <- ggplot(res, aes(x = depth, y = variable, fill = variable)) +
+      geom_density_ridges(stat='binline', alpha = 0.5, draw_baseline=T, binwidth=1, scale=0.8) +
+      labs(fill = "Variable") + ggtitle('Variables of whole tree')+
+      theme_minimal()
+    
+    df <- res %>% group_by(variable) %>% summarise(freq=n(), .groups = 'drop')
+    plt.var2 <- ggplot(df) + geom_bar(aes(x=variable, y=freq, fill=variable), stat='identity') + facet_wrap(~k) +
+      theme_minimal()
+  } else {
+    plt.var <- ggplot(res, aes(x = depth, y = variable, fill = variable)) +
+      geom_density_ridges(stat='binline', alpha = 0.5, draw_baseline=T, binwidth=1, scale=0.8) +
+      facet_wrap(~as.factor(k)) +
+      labs(fill = "Variable") + ggtitle('Variables of each tree')+
+      theme_minimal()
+    
+    df <- res %>% group_by(k, variable) %>% summarise(freq=n(), .groups = 'drop')
+    plt.var2 <- ggplot(df) + geom_bar(aes(x=variable, y=freq, fill=variable), stat='identity') + facet_wrap(~k) +
+      theme_minimal()
+  }
+  
+  print(ggarrange(plt.var, plt.var2))
 }
