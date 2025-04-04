@@ -157,10 +157,10 @@ Predict.partial.dependence <- function(bart, x, predictor.label, x.known) {
   y.output <- vapply(x, function(x.i) {
     x.known[,predictor.label] <- x.i
     raw.pred <- Predict.compress(bart, x.known, raw.mat = T, parallel = T, cl)
-    sum(raw.pred)/nrow(raw.pred)
+    mean(raw.pred)
   }, numeric(1))
   
-  return(y.output)
+  return((y.output+0.5)*bart$y.range+bart$y.shift)
 }
 
 Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
