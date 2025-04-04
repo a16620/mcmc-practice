@@ -180,7 +180,7 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
   } else {
     batch.pred <- vapply(bart$trees, function(tree.set) {
       #한 세트의 트리 각각 예측값을 얻는다.
-      C_predict_single_set(x, tree.set)
+      cpp.func$C_predict_single_set(x, tree.set)
     }, numeric(nrow(x)))
   }
   
