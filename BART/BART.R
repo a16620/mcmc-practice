@@ -150,17 +150,21 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, i
     )
 }
 
-Predict.partial.dependence <- function(bart, x, predictor.label, x.known) {
-  cl <- makeCluster(detectCores())
-  on.exit(stopCluster(cl))
+Predict.partial.dependence <- function(bart, x, predictor.label, x.known, parallel=F) {
+  if (parallel) {
+    cl <- makeCluster(detectCores())
+    on.exit(stopCluster(cl))
+  } else {
+    cl <- NULL
+  }
   
   y.output <- vapply(x, function(x.i) {
     x.known[,predictor.label] <- x.i
-    raw.pred <- Predict.compress(bart, x.known, raw.mat = T, parallel = T, cl)
+    raw.pred <- Predict.compress(bart, x.known, raw.mat = T, parallel = parallel, cl)
     mean(raw.pred)
   }, numeric(1))
   
-  return((y.output+0.5)*bart$y.range+bart$y.shift)
+  return(y.output)
 }
 
 Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
@@ -175,7 +179,7 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
     #clusterExport(clp, varlist = c("x", "cpp.func"), envir = environment())
     batch.pred <- foreach(tree.set=bart$trees, .combine = cbind) %do% {
       #한 세트의 트리 각각 예측값을 얻는다.
-      cpp.func$C_predict_single_set(X2, tree.set)
+      cpp.func$C_predict_single_set(x, tree.set)
     }
   } else {
     batch.pred <- vapply(bart$trees, function(tree.set) {
@@ -185,7 +189,7 @@ Predict.compress <- function(bart, x, raw.mat=F, parallel=F, cl=NULL) {
   }
   
   if (raw.mat) {
-    return(batch.pred)
+    return((batch.pred+0.5)*bart$y.range+bart$y.shift)
   }
   
   batch.summary <- t(apply(batch.pred, 1, function(obs.preds) {
@@ -729,13 +733,15 @@ fetch.bart.variable <- function(bart) {
 
 plot.bart.variable <- function(bart, sum.by.tree=F) {
   res <- fetch.bart.variable(bart)
+  ni <- length(bart$trees)
+  m <- ni*length(bart$trees[[1]])
   if (sum.by.tree) {
     plt.var <- ggplot(res, aes(x = depth, y = variable, fill = variable)) +
       geom_density_ridges(stat='binline', alpha = 0.5, draw_baseline=T, binwidth=1, scale=0.8) +
       labs(fill = "Variable") + ggtitle('Variables of whole tree')+
       theme_minimal()
     
-    df <- res %>% group_by(variable) %>% summarise(freq=n(), .groups = 'drop')
+    df <- res %>% group_by(variable) %>% summarise(freq=n()/m, .groups = 'drop')
     plt.var2 <- ggplot(df) + geom_bar(aes(x=variable, y=freq, fill=variable), stat='identity') + facet_wrap(~k) +
       theme_minimal()
   } else {
@@ -745,7 +751,7 @@ plot.bart.variable <- function(bart, sum.by.tree=F) {
       labs(fill = "Variable") + ggtitle('Variables of each tree')+
       theme_minimal()
     
-    df <- res %>% group_by(k, variable) %>% summarise(freq=n(), .groups = 'drop')
+    df <- res %>% group_by(k, variable) %>% summarise(freq=n()/ni, .groups = 'drop')
     plt.var2 <- ggplot(df) + geom_bar(aes(x=variable, y=freq, fill=variable), stat='identity') + facet_wrap(~k) +
       theme_minimal()
   }
