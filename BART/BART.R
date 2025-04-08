@@ -83,7 +83,7 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, i
       y.residual <- y.residual.total+y.est[,k]
       tree.k <- mcmc.trees[[k]]
       
-      mc.move <- sample(1:3, 1)
+      mc.move <- sample.int(3, 1)
       if (mc.move == 1) { #grow
         mc.proposal <- MC.MOVE.GROW(tree.k, x, y.residual, tree.prior, node.prior, mcmc.sigma)
       } else if (mc.move == 2) { #prune
@@ -114,7 +114,7 @@ BART <- function(x, y, m, k, tree.prior, sigma.param=c(3, .9), col.prior=NULL, i
       y.residual <- y.residual.total+y.est[,k]
       tree.k <- mcmc.trees[[k]]
       
-      mc.move <- sample(1:3, 1)
+      mc.move <- sample.int(3, 1)
       if (mc.move == 1) { #grow
         mc.proposal <- BART.move.grow(tree.k, x, y.residual, tree.prior, node.prior, mcmc.sigma)
       } else if (mc.move == 2) { #prune
@@ -274,7 +274,7 @@ BART.move.grow <- function(tree, x, y, tree.prior, lik.prior, sigma) {
   
   len.can.grow <- length(can.grow)
   while (len.can.grow > 0) {
-    grow.node.idx <- sample(1:len.can.grow, 1)
+    grow.node.idx <- sample.int(len.can.grow, 1)
     grow.node <- can.grow[[grow.node.idx]]
     
     rule.candidate <- rule.select(grow.node, x)
@@ -331,14 +331,14 @@ BART.move.grow.diric <- function(tree, x, y, tree.prior, lik.prior, sigma) {
   
   len.can.grow <- length(can.grow)
   while (len.can.grow > 0) {
-    grow.node.idx <- sample(1:len.can.grow, 1)
+    grow.node.idx <- sample.int(len.can.grow, 1)
     grow.node <- can.grow[[grow.node.idx]]
     
     rule.candidate <- rule.select(grow.node, x)
     
     len.rule.candidate <- length(rule.candidate)
     if (len.rule.candidate > 0) {
-      rule.selected.dir <- sample.with.diric(rule.candidate, tree.proposed$col.alpha[names(rule.candidate)], sum.a=sum(tree.proposed$col.alpha))
+      rule.selected.dir <- sample.with.diric(rule.candidate, tree.proposed$col.alpha[names(rule.candidate)], sum.a=sum(tree.proposed$col.alpha), a.delta=tree.proposed$diric.amp)
       rule.selected <- rule.selected.dir$val
       
       grow.node$split.rule <- rule.selected
@@ -441,7 +441,7 @@ BART.move.prune.diric <- function(tree, x, y, tree.prior, lik.prior, sigma) {
   c.idx <- which(colnames(x) == cn)[1]
   tree.proposed$col.alpha[cn] <- tree.proposed$col.alpha[cn] - tree.proposed$diric.amp
   
-  l.proposal <- log(n.prune)-log(tree.proposed$leafCount-1)+prob.sample.diric(c.idx, tree.proposed$col.alpha)-log(length(prune.node$obs.idx))
+  l.proposal <- log(n.prune)-log(tree.proposed$leafCount-1)+prob.sample.diric(c.idx, tree.proposed$col.alpha, a.delta=tree.proposed$diric.amp)-log(length(prune.node$obs.idx))
   l.prior <- -(log(tree.prior[1])+tree.prior[2]*log(grow.depth)-log1p(-tree.prior[1]*grow.depth**tree.prior[2])+2*log1p(-tree.prior[1]*(grow.depth+1)**tree.prior[2]))
   
   l.lik <- llik.node(prune.node$children, y, lik.prior, sigma)-llik.node(prune.node, y, lik.prior, sigma)
@@ -463,7 +463,7 @@ BART.move.change <- function(tree, x, y, lik.prior, sigma) {
   len.can.change <- length(can.change)
   
   while (len.can.change > 0) {
-    change.node.idx <- sample(1:len.can.change, 1)
+    change.node.idx <- sample.int(len.can.change, 1)
     change.node <- can.change[[change.node.idx]]
     rule.rollback <- change.node$split.rule
     change.node.llik.before <- llik.node(change.node$leaves, y, lik.prior, sigma)
@@ -515,16 +515,17 @@ BART.move.change.diric <- function(tree, x, y, lik.prior, sigma) {
   len.can.change <- length(can.change)
   
   while (len.can.change > 0) {
-    change.node.idx <- sample(1:len.can.change, 1)
+    change.node.idx <- sample.int(len.can.change, 1)
     change.node <- can.change[[change.node.idx]]
     rule.rollback <- change.node$split.rule
     change.node.llik.before <- llik.node(change.node$leaves, y, lik.prior, sigma)
     
-    alpha.before <- tree.proposed$col.alpha - as.integer(colnames(x) == names(rule.rollback))*tree.proposed$diric.amp
+    alpha.forward <- tree.proposed$col.alpha
+    sum.a.forward <- sum(alpha.forward)
     
     for (try in 1:50) {
       rule.candidate <- rule.select(change.node, x)
-      rule.shuffle.dir <- sample.with.diric(rule.candidate, alpha.before[names(rule.candidate)], length(rule.candidate), sum(alpha.before))
+      rule.shuffle.dir <- sample.with.diric(rule.candidate, alpha.forward[names(rule.candidate)], length(rule.candidate), sum.a.forward, a.delta=tree.proposed$diric.amp)
       rule.shuffle <- rule.shuffle.dir$val
       
       ok <- F
@@ -558,12 +559,15 @@ BART.move.change.diric <- function(tree, x, y, lik.prior, sigma) {
     l.proposal <- 0
   } else {
     l.lik <- llik.node(change.node$leaves, y, lik.prior, sigma)-change.node.llik.before
-    c.idx.reverse <-  which(colnames(x) == names(rule.rollback))[1]
-    l.proposal <- prob.sample.diric(c.idx.reverse, alpha.before)-rule.shuffle.dir$prob[i]
+    cn.filter <- colnames(x) == names(rule.rollback)
+    c.idx.reverse <-  which(cn.filter)[1]
+    alpha.reverse <- alpha.forward - as.numeric(cn.filter)*tree.proposed$diric.amp
     
     cn <- names(change.node$split.rule)
-    alpha.before[cn] <- alpha.before[cn] + tree.proposed$diric.amp
-    tree.proposed$col.alpha <- alpha.before
+    alpha.reverse[cn] <- alpha.reverse[cn] + tree.proposed$diric.amp
+    tree.proposed$col.alpha <- alpha.reverse
+    
+    l.proposal <- prob.sample.diric(c.idx.reverse, alpha.reverse, sum.a.forward, tree.proposed$diric.amp)-rule.shuffle.dir$prob[i]
   }
   
   list(
@@ -659,8 +663,27 @@ rule.split.idx <- function(rule, x, idx) {
 }
 
 sample.safe.name <- function(x, n) {
-  x[sample(1:length(x), n)]
+  x[sample.int(length(x), n)]
 }
+
+sample.with.diric <- function(x, a, n=1, sum.a=sum(a), a.delta=1) {
+  len.a <- length(a)
+  prob.from.diric <- rgamma(len.a, a, 1) #prob=weight라 정규화X
+  
+  if (all(prob.from.diric < 1e-7))
+    prob.from.diric <- NULL
+  
+  x.idx <- sample.int(length(x), n, prob = prob.from.diric)
+  
+  list(val=x[x.idx], prob=lgamma(a[x.idx]+a.delta)-lgamma(sum.a+a.delta)+lgamma(sum.a)-lgamma(a[x.idx]))
+}
+
+prob.sample.diric <- function(x.idx, a, sum.a=sum(a), a.delta=1) {
+  lgamma(a[x.idx]+a.delta)-lgamma(sum.a+a.delta)+lgamma(sum.a)-lgamma(a[x.idx])
+}
+
+######## after MCMC
+
 
 compress.DT <- function(tree) {
   as.list(tree, keepOnly = c('split.rule', 'rule.name', 'node.param'))
@@ -692,22 +715,6 @@ compress.DT2 <- function(col.dict) {
     }
     return(cbind(split.col,split.val,child.left))
   }
-}
-
-sample.with.diric <- function(x, a, n=1, sum.a=NA) {
-  y <- rgamma(length(a), a, 1)
-  prob.from.diric <- y/sum(y)
-  
-  x.idx <- sample(1:length(x), n, prob = prob.from.diric)
-  if (is.na(sum.a))
-    sum.a <- sum(a)
-  
-  list(val=x[x.idx], prob=lgamma(a[x.idx]+1)-lgamma(sum.a+1)+lgamma(sum.a)-lgamma(a[x.idx]))
-}
-
-prob.sample.diric <- function(x.idx, a) {
-  sum.a <- sum(a)
-  lgamma(a[x.idx]+1)-lgamma(sum.a+1)+lgamma(sum.a)-lgamma(a[x.idx])
 }
 
 fetch.bart.variable <- function(bart) {
